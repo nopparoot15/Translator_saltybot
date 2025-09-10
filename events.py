@@ -1,6 +1,6 @@
 # events.py
+
 import os
-import re
 import logging
 
 from constants import (
@@ -17,55 +17,21 @@ from app_redis import (
     increment_user_usage, get_channel_lang_hist, get_user_lang_hist,
     incr_channel_lang_hist, incr_user_lang_hist
 )
-from media_utils import ensure_stt_compatible, transcode_to_wav_pcm16
+from media_utils import ensure_stt_compatible
 from stt_google_sync import stt_transcribe_bytes
 from stt_google_async import transcribe_long_audio_bytes
 from stt_lang_utils import (
-    detect_lang_hints_from_context, pick_alternative_langs, choose_alts_strict_first,
-    detect_script_from_text,
+    detect_lang_hints_from_context, pick_alternative_langs,
+    choose_alts_strict_first, detect_script_from_text,
 )
 from tts_lang_resolver import (
-    split_text_by_script, merge_adjacent_parts, resolve_parts_for_tts, is_emoji_only, safe_detect,
+    split_text_by_script, merge_adjacent_parts, resolve_parts_for_tts,
+    is_emoji_only, safe_detect,
 )
 from tts_service import speak_text_multi
 from config import GOOGLE_API_KEY, GCS_BUCKET_NAME
 
 logger = logging.getLogger(__name__)
-
-
-def _choose_base_lang(
-    *,
-    default_base: str,
-    context_bias: dict,
-    user_hist: dict | None,
-    channel_hist: dict | None,
-    filename: str,
-    caption: str,
-) -> str:
-    """
-    เลือก base_lang แบบไดนามิกจากสัญญาณรวม:
-    - ฮินต์แรงจากชื่อไฟล์/แคปชันที่มี ฮิระ/คาตะ/คันจิ -> บังคับ ja-JP
-    - รวมคะแนน context_bias + ประวัติ user/channel
-    - ถ้าคะแนนรวมสูงพอ ให้ใช้ภาษานั้นเป็น base; ไม่งั้น fallback เป็น default_base
-    """
-    blob = (filename or "") + " " + (caption or "")
-    if re.search(r"[\u3040-\u30FF\u4E00-\u9FFF]", blob):
-        return "ja-JP"
-
-    user_hist = user_hist or {}
-    channel_hist = channel_hist or {}
-
-    candidates = ["th-TH", "ja-JP", "cmn-Hans-CN", "ko-KR", "ru-RU", "vi-VN", "en-US"]
-
-    def score(lang: str) -> float:
-        return (
-            float(context_bias.get(lang, 0.0))
-            + 1.4 * float(user_hist.get(lang, 0))
-            + 0.8 * float(channel_hist.get(lang, 0))
-        )
-
-    winner = max(candidates, key=score)
-    return winner if score(winner) >= 1.0 else default_base
 
 
 def register_message_handlers(bot):
@@ -74,7 +40,7 @@ def register_message_handlers(bot):
         if message.author.bot:
             return
 
-        # 1) prefix commands → ให้ commands framework จัดการ
+        # 1) prefix commands → ให้ commands framework จัดการ (เราแค่ไม่ทำงานใน listener นี้)
         if message.content.startswith("!"):
             return
 
@@ -89,17 +55,17 @@ def register_message_handlers(bot):
             image_attachments = [
                 a for a in message.attachments
                 if (a.filename or "").lower().endswith(valid_img_exts)
-                   or (a.content_type or "").startswith("image/")
+                or (a.content_type or "").startswith("image/")
             ]
             audio_attachments = [
                 a for a in message.attachments
                 if (a.filename or "").lower().endswith(AUDIO_EXTS)
-                   or (a.content_type or "").startswith(("audio/", "video/"))
+                or (a.content_type or "").startswith(("audio/", "video/"))
             ]
 
             # ---- (A) OCR ----
             if image_attachments:
-                for attachment in image_attachments[:1]:
+                for attachment in image_attachments[:1]:  # กันสแปม: รูปแรกพอ
                     filename = (attachment.filename or "").lower()
                     content_type = attachment.content_type or ""
                     try:
@@ -147,13 +113,13 @@ def register_message_handlers(bot):
 
                         await increment_user_usage(message.author.id, message.guild.id)
 
-                        # 1) ทำให้ไฟล์เข้ากับ STT เสมอ
-                        audio_bytes, filename2, content_type2, did_trans = await ensure_stt_compatible(
+                        # 1) ทำให้ไฟล์เข้ากับ STT (กัน 400 + ลด empty)
+                        audio_bytes, filename, content_type, did_trans = await ensure_stt_compatible(
                             filename, content_type, raw_bytes
                         )
-                        filename, content_type = filename2, content_type2
 
-                        # 2) คำนวณ base_lang แบบไดนามิก (สำคัญมาก)
+                        # 2) alt ภาษาแบบฉลาด
+                        base_lang = "th-TH"  # base เริ่มต้น
                         context_bias = detect_lang_hints_from_context(
                             username=str(message.author),
                             channel_name=getattr(message.channel, "name", "") or "",
@@ -162,33 +128,30 @@ def register_message_handlers(bot):
                         channel_hist = await get_channel_lang_hist(message.channel.id)
                         user_hist = await get_user_lang_hist(message.author.id)
 
-                        base_lang = _choose_base_lang(
-                            default_base="th-TH",
-                            context_bias=context_bias,
-                            user_hist=user_hist,
-                            channel_hist=channel_hist,
-                            filename=filename,
-                            caption=message.content or "",
-                        )
-
-                        # 3) alternative languages
                         alt_smart = pick_alternative_langs(
                             base_lang=base_lang, max_alts=3,
                             channel_hist=channel_hist, user_hist=user_hist,
                             context_bias=context_bias,
                         )
+
+                        # ✅ ไม่บังคับ strict-first เพื่อให้ alt ทำงานตั้งแต่รอบแรก
                         alt_round1, alt_round2 = choose_alts_strict_first(
-                            base_lang=base_lang, alt_smart=alt_smart, force_strict_if_confident=True,
-                            context_bias=context_bias, strict_confidence_threshold=2.0,
-                            exclude_in_fallback=None, per_round_limit=3,
+                            base_lang=base_lang,
+                            alt_smart=alt_smart,
+                            force_strict_if_confident=False,   # << เปลี่ยนเป็น False
+                            context_bias=context_bias,
+                            strict_confidence_threshold=2.0,
+                            exclude_in_fallback=None,
+                            per_round_limit=3,
                         )
 
-                        # 4) เลือกโหมด STT
+                        # 3) เลือกโหมด
                         use_long = len(audio_bytes) > 9_000_000
                         stt_mode = "google longrunning" if use_long else "google sync"
 
                         async def _run_stt_once(alt_list):
                             if use_long:
+                                # ❗ อย่าส่งพารามิเตอร์ที่ wrapper ไม่รองรับ (enable_automatic_punctuation/sample_rate_hz)
                                 lr_kwargs = dict(
                                     audio_bytes=audio_bytes,
                                     file_ext=os.path.splitext(filename)[1] or ".wav",
@@ -198,16 +161,21 @@ def register_message_handlers(bot):
                                     alternative_language_codes=(alt_list or [])[:3],
                                     poll=True,
                                     max_wait_sec=900.0,
-                                    enable_automatic_punctuation=True,
                                 )
+                                # ระบุช่องสัญญาณให้ตรงกรณีที่รู้แน่ ๆ
                                 if content_type.startswith("audio/wav") or filename.endswith(".wav"):
-                                    lr_kwargs.update(sample_rate_hz=16000, audio_channel_count=1,
-                                                     enable_separate_recognition_per_channel=False)
+                                    lr_kwargs.update(
+                                        audio_channel_count=1,
+                                        enable_separate_recognition_per_channel=False
+                                    )
                                 elif filename.endswith((".ogg", ".opus")) or "opus" in content_type:
-                                    lr_kwargs.update(sample_rate_hz=48000)
+                                    # longrunning: ไม่ตั้ง sample_rate_hz ที่ wrapper ไม่มี
+                                    pass
                                 else:
-                                    lr_kwargs.update(audio_channel_count=1,
-                                                     enable_separate_recognition_per_channel=False)
+                                    lr_kwargs.update(
+                                        audio_channel_count=1,
+                                        enable_separate_recognition_per_channel=False
+                                    )
                                 return await transcribe_long_audio_bytes(**lr_kwargs)
                             else:
                                 sync_kwargs = dict(
@@ -221,17 +189,23 @@ def register_message_handlers(bot):
                                     max_alternatives=1,
                                     timeout_s=90.0,
                                 )
+                                # synchronous รองรับ sample_rate_hz
                                 if content_type.startswith("audio/wav") or filename.endswith(".wav"):
-                                    sync_kwargs.update(sample_rate_hz=16000, audio_channel_count=1,
-                                                       enable_separate_recognition_per_channel=False)
+                                    sync_kwargs.update(
+                                        sample_rate_hz=16000,
+                                        audio_channel_count=1,
+                                        enable_separate_recognition_per_channel=False
+                                    )
                                 elif filename.endswith((".ogg", ".opus")) or "opus" in content_type:
                                     sync_kwargs.update(sample_rate_hz=48000)
                                 else:
-                                    sync_kwargs.update(audio_channel_count=1,
-                                                       enable_separate_recognition_per_channel=False)
+                                    sync_kwargs.update(
+                                        audio_channel_count=1,
+                                        enable_separate_recognition_per_channel=False
+                                    )
                                 return await stt_transcribe_bytes(**sync_kwargs)
 
-                        # ---- Attempt 1 (strict-first) ----
+                        # ---- Attempt 1 (alts รอบแรก) ----
                         text, raw = await _run_stt_once(alt_round1)
 
                         # error ฝั่ง API
@@ -245,32 +219,22 @@ def register_message_handlers(bot):
                             await message.channel.send(f"{text}\n{err_preview}" if err_preview else text)
                             return
 
-                        def _looks_thai(s: str) -> bool:
-                            return any("\u0E00" <= ch <= "\u0E7F" for ch in (s or ""))
-
-                        # ---- Attempt 2 (fallback alts) ----
-                        need_retry = (not text.strip()) or (
-                            stt_mode.startswith("google")
-                            and base_lang == "th-TH"
-                            and not _looks_thai(text)
-                        )
+                        # ต้องลองรอบสองไหม?
+                        need_retry = not text.strip()
                         if need_retry:
                             text2, raw2 = await _run_stt_once(alt_round2)
                             if text2.strip():
                                 text, raw = text2, raw2
 
-                        # ---- Second chance: force transcode → WAV แล้วลองใหม่ ----
+                        # ---- second chance: transcode→wav แล้วลองใหม่ ----
                         if (not text.strip()) and (not did_trans):
                             try:
-                                orig_ext = (os.path.splitext(a.filename or "")[1] or "").lower()
-                                orig_ct = (a.content_type or "").lower()
-
-                                audio_bytes = await transcode_to_wav_pcm16(
-                                    raw_bytes, rate=16000, ch=1,
-                                    src_ext=orig_ext, content_type=orig_ct
+                                audio_bytes2, filename2, content_type2, _ = await ensure_stt_compatible(
+                                    a.filename or "", a.content_type or "", raw_bytes
                                 )
-                                filename = f"{os.path.splitext(filename)[0]}.wav"
-                                content_type = "audio/wav"
+                                audio_bytes = audio_bytes2
+                                filename = filename2
+                                content_type = content_type2
 
                                 use_long = len(audio_bytes) > 9_000_000
                                 stt_mode = "google longrunning" if use_long else "google sync"
@@ -346,7 +310,7 @@ def register_message_handlers(bot):
         if message.channel.id in TRANSLATION_CHANNELS:
             await increment_user_usage(message.author.id, message.guild.id)
 
-            # DETAILED EN/JA
+            # DETAILED EN
             if message.channel.id in DETAILED_EN_CHANNELS:
                 if len(text) > MAX_INPUT_LENGTH:
                     await message.channel.send("❗ ข้อความยาวเกินไปสำหรับการวิเคราะห์แบบละเอียด กรุณาส่งประโยคสั้นลง")
@@ -363,6 +327,7 @@ def register_message_handlers(bot):
                 await send_long_message(message.channel, (ans or "").strip())
                 return
 
+            # DETAILED JA
             if message.channel.id in DETAILED_JA_CHANNELS:
                 if len(text) > MAX_INPUT_LENGTH:
                     await message.channel.send("❗ ข้อความยาวเกินไปสำหรับการวิเคราะห์แบบละเอียด กรุณาส่งประโยคสั้นลง")
