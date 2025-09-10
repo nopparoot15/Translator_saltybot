@@ -4,10 +4,16 @@ from datetime import datetime, timedelta
 
 from lang_config import FLAGS
 from constants import GOOGLE_TRANSLATE_DAILY_LIMIT, OCR_DAILY_LIMIT
-from app_redis import get_gtrans_used_today, get_ocr_quota_remaining, stt_get_used
+from app_redis import (
+    get_gtrans_used_today,
+    get_ocr_quota_remaining,
+    stt_get_used,
+    init_redis,
+    get_redis_client,
+)
 from tts_service import user_tts_engine, server_tts_engine, get_tts_engine
 from translation_service import translator_server_engine, get_translator_engine
-from config import STT_DAILY_LIMIT_SECONDS, TZ
+from config import STT_DAILY_LIMIT_SECONDS, TZ, STT_QUOTA_SCOPE, REDIS_URL
 
 def register_commands(bot: commands.Bot):
 
