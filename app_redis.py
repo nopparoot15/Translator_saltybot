@@ -65,6 +65,8 @@ def _seconds_until_local_midnight(tz: ZoneInfo) -> int:
     return max(0, int((nxt - now).total_seconds()))
 
 def _key_stt_seconds(date_str: str, user_id: int, guild_id: Optional[int]) -> str:
+    if _STT_SCOPE == "global":
+        return f"stt:sec:{date_str}:global"
     if _STT_SCOPE == "guild_user" and guild_id:
         return f"stt:sec:{date_str}:{int(guild_id)}:{int(user_id)}"
     return f"stt:sec:{date_str}:{int(user_id)}"
@@ -86,8 +88,7 @@ end
 """
 
 async def _ensure_lua_loaded():
-    """โหลดสคริปต์ Lua ลง Redis หนึ่งครั้งต่อโปรเซส"""
-    global _lua_reserve_sha
+    global _lua_reserve_sha, _redis
     if _lua_reserve_sha or _redis is None:
         return
     try:
@@ -95,46 +96,26 @@ async def _ensure_lua_loaded():
     except Exception:
         _lua_reserve_sha = None  # ให้ค่อย eval ได้ภายหลัง
 
-async def stt_try_reserve(
-    user_id: int,
-    guild_id: Optional[int],
-    seconds: int,
-    daily_limit: int,
-    tz: ZoneInfo
-) -> bool:
-    """
-    พยายาม "จอง" วินาที STT แบบอะตอมมิกก่อนเริ่มถอดเสียง
-    - สำเร็จ (ยังไม่เกินลิมิต): return True
-    - เกินลิมิต: return False
-    - Redis ล่ม/ผิดพลาด: (เลือก) fail-open -> return True เพื่อไม่บล็อกผู้ใช้
-    """
+async def stt_try_reserve(user_id: int, guild_id: Optional[int], seconds: int, daily_limit: int, tz: ZoneInfo) -> bool:
     if _redis is None:
-        # ยังไม่ได้ init หรือไม่มีไลบรารี — fail-open
-        return True
+        return True  # fail-open
     try:
         await _ensure_lua_loaded()
         date_str = _local_datestr(tz)
         key = _key_stt_seconds(date_str, user_id, guild_id)
-        ttl = _seconds_until_local_midnight(tz) + 60  # กันเผื่อ 1 นาที
-
+        ttl = _seconds_until_local_midnight(tz) + 60
         if _lua_reserve_sha:
             try:
                 res = await _redis.evalsha(_lua_reserve_sha, 1, key, daily_limit, int(seconds), ttl)
             except ResponseError:
-                # กรณี NOSCRIPT ให้ fallback เป็น eval ตรง ๆ
                 res = await _redis.eval(_LUA_RESERVE, 1, key, daily_limit, int(seconds), ttl)
         else:
             res = await _redis.eval(_LUA_RESERVE, 1, key, daily_limit, int(seconds), ttl)
-
         return int(res) != -1
     except Exception:
-        # ไม่อยาก "ดับทั้งฟีเจอร์" เพราะ Redis พัง — เลือกเปิดผ่าน
         return True
 
 async def stt_refund(user_id: int, guild_id: Optional[int], seconds: int, tz: ZoneInfo) -> None:
-    """
-    คืนวินาทีที่จองไว้ (กรณี STT ล้มเหลว) — ลดค่าใช้งานลง แต่ไม่ให้ติดลบ
-    """
     if _redis is None:
         return
     try:
@@ -142,9 +123,7 @@ async def stt_refund(user_id: int, guild_id: Optional[int], seconds: int, tz: Zo
         key = _key_stt_seconds(date_str, user_id, guild_id)
         newv = await _redis.decrby(key, int(seconds))
         if int(newv) < 0:
-            # กันค่าติดลบในกรณี concurrent
             await _redis.set(key, 0)
-        # ย้ำ TTL ถึงเที่ยงคืน ถ้า key เพิ่งถูกสร้างจาก refund (ไม่น่าเกิด แต่กันไว้)
         ttl = await _redis.ttl(key)
         if ttl is None or ttl < 0:
             await _redis.expire(key, _seconds_until_local_midnight(tz) + 60)
@@ -153,7 +132,9 @@ async def stt_refund(user_id: int, guild_id: Optional[int], seconds: int, tz: Zo
 
 async def stt_get_used(user_id: int, guild_id: Optional[int], tz: ZoneInfo) -> int:
     """
-    คืนจำนวนวินาทีที่ใช้ไปแล้ววันนี้ (0 ถ้าไม่มี/Redis มีปัญหา)
+    คืนจำนวนวินาทีที่ใช้แล้ววันนี้
+    - โหมด global: คืนค่ารวมทั้งบอท
+    - โหมดอื่น: คืนค่าตาม key ของ user / guild_user
     """
     if _redis is None:
         return 0
