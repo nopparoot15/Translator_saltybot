@@ -94,15 +94,19 @@ def register_commands(bot: commands.Bot):
             used = int(used or 0)
             remain = max(0, STT_DAILY_LIMIT_SECONDS - used)
             reset_in = _seconds_until_local_midnight(TZ)
-
-            embed = discord.Embed(
-                title="🎙️ STT Quota วันนี้",
-                color=discord.Color.teal()
-            )
+    
+            title = "🎙️ STT Quota วันนี้"
+            if STT_QUOTA_SCOPE.lower() == "global":
+                title += " (ทั้งบอท)"
+    
+            embed = discord.Embed(title=title, color=discord.Color.teal())
             embed.add_field(name="ใช้ไปแล้ว", value=f"{used} วินาที", inline=True)
             embed.add_field(name="โควต้าทั้งวัน", value=f"{STT_DAILY_LIMIT_SECONDS} วินาที", inline=True)
             embed.add_field(name="เหลือ", value=f"{remain} วินาที", inline=True)
-            embed.set_footer(text=f"รีเซ็ตทุก 00:00 (Asia/Bangkok) • เหลืออีก {_fmt_hms(reset_in)}")
+            footer = "รีเซ็ตทุก 00:00 (Asia/Bangkok)"
+            if STT_QUOTA_SCOPE.lower() == "global":
+                footer += " • โหมด: global"
+            embed.set_footer(text=footer)
             await ctx.send(embed=embed, delete_after=15)
         except Exception:
             await ctx.send("❌ ไม่สามารถตรวจสอบโควต้า STT ได้ในขณะนี้", delete_after=8)
