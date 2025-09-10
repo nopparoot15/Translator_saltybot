@@ -91,21 +91,33 @@ class STTLanguagePanel(discord.ui.View):
 
     async def _choose(self, interaction: discord.Interaction, code: str):
         self.processing = True
-        # ปิดปุ่มทั้งหมด
-        for child in self.children:
-            child.disabled = True
+    
+        # ✅ รับ interaction ไว้ก่อน กัน timeout
         try:
             if not interaction.response.is_done():
-                await interaction.response.edit_message(
-                    content=f"⏳ Transcribing… (`{code}` selected)", view=self
-                )
-            else:
-                await interaction.message.edit(content=f"⏳ Transcribing… (`{code}` selected)", view=self)
+                await interaction.response.defer()
         except Exception:
             pass
-
-        # เรียก callback ภายนอกเพื่อถอดเสียง
+    
+        # ✅ พยายามลบข้อความแผงเลือกภาษาออกเลย
+        try:
+            picker_msg = interaction.message or getattr(self, "frame_message", None)
+            if isinstance(picker_msg, discord.Message):
+                await picker_msg.delete()
+        except Exception:
+            # ถ้าลบไม่ได้ ให้ปิดปุ่มและแสดงสถานะสั้น ๆ แทน
+            try:
+                for child in self.children:
+                    child.disabled = True
+                await interaction.message.edit(
+                    content=f"⏳ Transcribing… (`{code}` selected)", view=self
+                )
+            except Exception:
+                pass
+    
+        # ▶️ ถอดเสียงตามภาษาที่เลือก (callback ภายนอกจะเป็นคนส่ง transcript แบบ reply)
         try:
             await self.on_choose_lang(interaction, code)
         finally:
             self.stop()
+
