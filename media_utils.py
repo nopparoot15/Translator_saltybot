@@ -1,7 +1,12 @@
 import os
+import math
 import tempfile
 import asyncio.subprocess as asp
-from typing import Optional, Tuple
+from typing import Optional
+
+# ------------------------------------------------------------
+# MIME guess
+# ------------------------------------------------------------
 
 def guess_content_type(filename: str, fallback: str = "application/octet-stream") -> str:
     ext = (os.path.splitext(filename)[1] or "").lower()
@@ -17,7 +22,14 @@ def guess_content_type(filename: str, fallback: str = "application/octet-stream"
         ".flac": "audio/flac",
     }.get(ext, fallback)
 
+# ------------------------------------------------------------
+# Subprocess helper
+# ------------------------------------------------------------
+
 async def _run_cmd(cmd: list[str], *, stdin: bytes | None) -> tuple[bytes, str, int]:
+    """
+    รันคำสั่งแบบ async; คืน (stdout_bytes, stderr_text, returncode)
+    """
     proc = await asp.create_subprocess_exec(
         *cmd,
         stdin=asp.PIPE if stdin is not None else None,
@@ -27,10 +39,17 @@ async def _run_cmd(cmd: list[str], *, stdin: bytes | None) -> tuple[bytes, str, 
     out, err = await proc.communicate(input=stdin)
     return out or b"", (err.decode("utf-8", "ignore") if err else ""), proc.returncode
 
+# ------------------------------------------------------------
+# FFmpeg transcoding
+# ------------------------------------------------------------
+
 async def transcode_to_wav_pcm16(
     audio_bytes: bytes, *, rate: int = 16000, ch: int = 1,
     src_ext: Optional[str] = None, content_type: Optional[str] = None,
 ) -> bytes:
+    """
+    แปลงสตรีมเสียงให้เป็น WAV (PCM 16-bit, mono, 16kHz) ผ่านหลายแผน (pipe → force demuxer → temp file)
+    """
     ext = (src_ext or "").lower()
     ctype = (content_type or "").lower()
 
@@ -53,7 +72,7 @@ async def transcode_to_wav_pcm16(
     if err: last_err = err
 
     # Plan B: force demuxers
-    def try_force(fmt):
+    def try_force(fmt: str) -> list[str]:
         return ["ffmpeg", "-nostdin", "-loglevel", "error", "-hide_banner", "-y",
                 "-f", fmt, "-probesize", "50M", "-analyzeduration", "200M",
                 "-i", "pipe:0", *common_tail]
@@ -123,6 +142,10 @@ async def transcode_to_wav_pcm16(
     tail = (last_err[-600:] if last_err else "no stderr")
     raise RuntimeError(f"ffmpeg transcode failed (multi-plan). tail:\n{tail}")
 
+# ------------------------------------------------------------
+# Ensure STT friendly format
+# ------------------------------------------------------------
+
 async def ensure_stt_compatible(
     filename: str, content_type: Optional[str], audio_bytes: bytes
 ) -> tuple[bytes, str, str, bool]:
@@ -145,3 +168,45 @@ async def ensure_stt_compatible(
         return wav, f"{base}.wav", "audio/wav", True
 
     return audio_bytes, filename, content_type or "", False
+
+# ------------------------------------------------------------
+# Helpers for STT quota flow
+# ------------------------------------------------------------
+
+async def download_to_temp(attachment) -> str:
+    """
+    ดาวน์โหลด discord.Attachment ไปไฟล์ชั่วคราว แล้วคืน path
+    ใช้สำหรับวัดความยาวไฟล์ก่อนทำ STT
+    """
+    suffix = ""
+    try:
+        if getattr(attachment, "filename", None):
+            dot = attachment.filename.rfind(".")
+            suffix = attachment.filename[dot:] if dot != -1 else ""
+    except Exception:
+        pass
+
+    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as f:
+        tmp_path = f.name
+    # discord.py: await Attachment.save(fp)
+    await attachment.save(tmp_path)
+    return tmp_path
+
+async def probe_duration_seconds(path: str) -> int:
+    """
+    ใช้ ffprobe วัดความยาวสื่อ (วินาที, ปัดขึ้น) — ถ้าอ่านไม่ได้คืน 0
+    """
+    try:
+        cmd = [
+            "ffprobe", "-v", "error",
+            "-show_entries", "format=duration",
+            "-of", "default=noprint_wrappers=1:nokey=1",
+            path,
+        ]
+        out, err, rc = await _run_cmd(cmd, stdin=None)
+        if rc != 0:
+            return 0
+        val = (out.decode("utf-8", "ignore") if isinstance(out, (bytes, bytearray)) else str(out)).strip()
+        return max(0, int(math.ceil(float(val))))
+    except Exception:
+        return 0
