@@ -1,15 +1,33 @@
 import discord
 from discord.ext import commands
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from lang_config import FLAGS
 from constants import GOOGLE_TRANSLATE_DAILY_LIMIT, OCR_DAILY_LIMIT
-from app_redis import get_gtrans_used_today, get_ocr_quota_remaining
+from app_redis import get_gtrans_used_today, get_ocr_quota_remaining, stt_get_used
 from tts_service import user_tts_engine, server_tts_engine, get_tts_engine
 from translation_service import translator_server_engine, get_translator_engine
+from config import STT_DAILY_LIMIT_SECONDS, TZ
 
 def register_commands(bot: commands.Bot):
 
+    # ---------- Helpers ----------
+    def _seconds_until_local_midnight(tz) -> int:
+        now = datetime.now(tz)
+        nxt = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+        return max(0, int((nxt - now).total_seconds()))
+
+    def _fmt_hms(sec: int) -> str:
+        h = sec // 3600
+        m = (sec % 3600) // 60
+        s = sec % 60
+        if h > 0:
+            return f"{h}ชม {m}น {s}วิ"
+        if m > 0:
+            return f"{m}น {s}วิ"
+        return f"{s}วิ"
+
+    # ---------- Commands ----------
     @bot.command(name="commands")
     async def show_commands(ctx: commands.Context):
         embed = discord.Embed(
@@ -20,6 +38,11 @@ def register_commands(bot: commands.Bot):
         embed.add_field(
             name="⚙️ General",
             value="`!clear [จำนวน]` — ลบข้อความ (สูงสุด 500)\n`!topusers` — อันดับการใช้งานบอทในเซิร์ฟเวอร์",
+            inline=False
+        )
+        embed.add_field(
+            name="🎙️ STT",
+            value="`!sttquota` — เช็คโควต้า STT รายวัน (วินาที)",
             inline=False
         )
         embed.add_field(
@@ -35,7 +58,7 @@ def register_commands(bot: commands.Bot):
             inline=False
         )
         embed.add_field(name="📸 OCR", value="`!ocr quota` — เช็คโควต้า OCR รายวัน", inline=False)
-        embed.add_field(name="🌐 Google Translate", value="`!gtrans quota` — เช็คโควต้า Google Translate ทั้งบอท", inline=False)
+        embed.add_field(name="🌐 Google Translate", value="`!gtrans` — เช็คโควต้า Google Translate ทั้งบอท", inline=False)
         embed.set_footer(text="พิมพ์ !commands เพื่อเรียกดูรายการนี้ได้ตลอดเวลา")
         await ctx.send(embed=embed, delete_after=30)
 
@@ -61,6 +84,30 @@ def register_commands(bot: commands.Bot):
         if isinstance(error, commands.MissingPermissions):
             await ctx.send("❌ คุณไม่มีสิทธิ์ในการใช้คำสั่งนี้", delete_after=5)
 
+    # ---------- STT QUOTA ----------
+    @bot.command(name="sttquota")
+    async def stt_quota(ctx: commands.Context):
+        guild_id = ctx.guild.id if ctx.guild else None
+        user_id = ctx.author.id
+        try:
+            used = await stt_get_used(user_id, guild_id, TZ)
+            used = int(used or 0)
+            remain = max(0, STT_DAILY_LIMIT_SECONDS - used)
+            reset_in = _seconds_until_local_midnight(TZ)
+
+            embed = discord.Embed(
+                title="🎙️ STT Quota วันนี้",
+                color=discord.Color.teal()
+            )
+            embed.add_field(name="ใช้ไปแล้ว", value=f"{used} วินาที", inline=True)
+            embed.add_field(name="โควต้าทั้งวัน", value=f"{STT_DAILY_LIMIT_SECONDS} วินาที", inline=True)
+            embed.add_field(name="เหลือ", value=f"{remain} วินาที", inline=True)
+            embed.set_footer(text=f"รีเซ็ตทุก 00:00 (Asia/Bangkok) • เหลืออีก {_fmt_hms(reset_in)}")
+            await ctx.send(embed=embed, delete_after=15)
+        except Exception:
+            await ctx.send("❌ ไม่สามารถตรวจสอบโควต้า STT ได้ในขณะนี้", delete_after=8)
+
+    # ---------- TTS ----------
     @bot.command(name="tts")
     async def set_tts_engine(ctx: commands.Context, *args: str):
         try:
@@ -91,11 +138,23 @@ def register_commands(bot: commands.Bot):
             effective = get_tts_engine(ctx.author.id, guild_id)
             await ctx.send(f"✅ TTS (you): `{prev}` → `{engine}`\n👉 ใช้งานจริงตอนนี้: `{effective}`", delete_after=6)
 
+    @bot.command(name="ttsstatus")
+    async def tts_status(ctx: commands.Context):
+        user_engine = user_tts_engine.get(ctx.author.id, "gtts")
+        server_engine = server_tts_engine.get(ctx.guild.id, "gtts") if ctx.guild else "gtts"
+        effective = get_tts_engine(ctx.author.id, ctx.guild.id if ctx.guild else 0)
+        embed = discord.Embed(title="🔊 TTS Engine Status", color=discord.Color.purple())
+        embed.add_field(name="ของคุณ", value=f"`{user_engine}`", inline=True)
+        embed.add_field(name="ของเซิร์ฟเวอร์", value=f"`{server_engine}`", inline=True)
+        embed.add_field(name="ใช้งานจริงตอนนี้", value=f"`{effective}`", inline=False)
+        await ctx.send(embed=embed, delete_after=10)
+
+    # ---------- OCR ----------
     @bot.command(name="ocr")
     async def ocr_group(ctx: commands.Context, subcommand: str | None = None):
         sub = (subcommand or "").lower().strip()
         if sub == "quota":
-            today = datetime.now().strftime("%Y-%m-%d")
+            today = datetime.now(TZ).strftime("%Y-%m-%d")
             remaining = await get_ocr_quota_remaining(user_id=ctx.author.id, date_str=today, per_user_limit=OCR_DAILY_LIMIT)
             if remaining >= 0:
                 await ctx.send(
@@ -107,6 +166,7 @@ def register_commands(bot: commands.Bot):
         else:
             await ctx.send("❓ ใช้งาน: `!ocr quota` เพื่อดูโควต้า OCR วันนี้ของคุณ", delete_after=8)
 
+    # ---------- Leaderboard ----------
     @bot.command(name="topusers")
     async def top_users(ctx: commands.Context):
         from app_redis import get_top_users
@@ -123,6 +183,7 @@ def register_commands(bot: commands.Bot):
         except Exception:
             await ctx.send("❌ ไม่สามารถดึงข้อมูลผู้ใช้งานได้", delete_after=6)
 
+    # ---------- Translator ----------
     @bot.command(name="translator")
     async def set_translator_provider(ctx: commands.Context, *args: str):
         try:
@@ -173,7 +234,7 @@ def register_commands(bot: commands.Bot):
 
     @bot.command(name="gtrans")
     async def gtrans_cmd(ctx: commands.Context, sub: str | None = None):
-        today = datetime.now().strftime("%Y-%m-%d")
+        today = datetime.now(TZ).strftime("%Y-%m-%d")
         try:
             used = await get_gtrans_used_today(date_str=today)
             remaining = max(0, GOOGLE_TRANSLATE_DAILY_LIMIT - (used or 0))
@@ -185,16 +246,6 @@ def register_commands(bot: commands.Bot):
         except Exception:
             await ctx.send("❌ ไม่สามารถตรวจสอบโควต้า Google Translate ได้", delete_after=8)
 
-    @bot.command(name="ttsstatus")
-    async def tts_status(ctx: commands.Context):
-        user_engine = user_tts_engine.get(ctx.author.id, "gtts")
-        server_engine = server_tts_engine.get(ctx.guild.id, "gtts")
-        effective = get_tts_engine(ctx.author.id, ctx.guild.id)
-        await ctx.send(
-            f"🔊 **TTS Engine Status**\n- ของคุณ: `{user_engine}`\n- ของเซิร์ฟเวอร์: `{server_engine}`\n- ใช้งานจริงตอนนี้: `{effective}`",
-            delete_after=10
-        )
-
     @bot.command(name="translatorstatus")
     async def translator_status(ctx: commands.Context):
         name_map = {"gpt4omini": "GPT-4o mini", "gpt5nano": "GPT-5 nano", "google": "Google Translate"}
@@ -203,7 +254,8 @@ def register_commands(bot: commands.Bot):
         effective_key = get_translator_engine(guild_id)
         server_engine = name_map.get(server_engine_key.lower(), server_engine_key)
         effective = name_map.get(effective_key.lower(), effective_key)
-        await ctx.send(
-            f"🌐 **Translator Engine Status**\n- ตั้งค่าไว้: `{server_engine}`\n- ใช้งานจริงตอนนี้: `{effective}`",
-            delete_after=10
-        )
+
+        embed = discord.Embed(title="🌐 Translator Engine Status", color=discord.Color.green())
+        embed.add_field(name="ตั้งค่าไว้ (เซิร์ฟเวอร์)", value=f"`{server_engine}`", inline=True)
+        embed.add_field(name="ใช้งานจริงตอนนี้", value=f"`{effective}`", inline=True)
+        await ctx.send(embed=embed, delete_after=10)
