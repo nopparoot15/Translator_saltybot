@@ -133,9 +133,26 @@ def _engine_label_line(message: discord.Message | None, provider_cb: Optional[Ca
     return (f"**Engine:** `{label}`\n") if label else ""
     
 
-async def send_transcript(message: discord.Message, text: str,
-                          engine_label_provider, stt_tag: str):
-    engine_label = engine_label_provider(message)
+async def send_transcript(
+    message: discord.Message,
+    text: str,
+    stt_tag: str,
+    *,
+    # ใส่ภาษาให้โชว์ เช่น "ja" / "ja-JP" / "th-TH"
+    lang_display: Optional[str] = None,
+    # ซ่อน/แสดง Engine (เราจะส่ง False ตอนใช้กับ STT)
+    show_engine: bool = True,
+    engine_label_provider=None,
+    # ถ้าจะอ้างอิงไปยังข้อความอื่น (เช่น ข้อความที่แนบไฟล์เสียง)
+    reply_to: Optional[discord.Message] = None,
+):
+    # ------- เตรียม label ต่าง ๆ -------
+    engine_label = ""
+    if show_engine and callable(engine_label_provider) and isinstance(message, discord.Message):
+        try:
+            engine_label = (engine_label_provider(message) or "").strip()
+        except Exception:
+            engine_label = ""
 
     # --- preview (กันล้น embed) ---
     safe_text = (text or "").replace("```", "``\u200b`")
@@ -143,20 +160,30 @@ async def send_transcript(message: discord.Message, text: str,
     is_truncated = len(safe_text) > PREVIEW_MAX
     preview = safe_text[:PREVIEW_MAX] + ("…" if is_truncated else "")
 
+    # ------- สร้าง embed -------
     embed = discord.Embed(color=discord.Color.blurple())
     embed.set_author(name="Translator bot")
-    embed.add_field(name="Engine", value=engine_label, inline=True)
+    # ❌ ไม่ใส่ Engine เมื่อ show_engine=False
+    if show_engine and engine_label:
+        embed.add_field(name="Engine", value=engine_label, inline=True)
+
+    # ใส่โหมด STT เสมอ
     embed.add_field(name="STT", value=stt_tag, inline=True)
+
+    # ✅ โชว์ภาษาที่ผู้ใช้เลือก
+    if lang_display:
+        embed.add_field(name="Lang", value=f"`{lang_display}`", inline=True)
+
     desc = f"📝 **Transcript (preview):**\n```{preview}```"
     if is_truncated:
         desc += "\n_(ข้อความยาว – แนบไฟล์ฉบับเต็มไว้ให้แล้ว)_"
     embed.description = desc
-    msg = await message.channel.send(
-        embed=embed,
-        reference=message,
-        mention_author=False,
-    )
 
+    # ส่งเป็น reply ไปยังข้อความที่แนบไฟล์เสียง (ถ้าไม่ได้ส่งมาก็อ้างอิง message เดิม)
+    ref_msg = reply_to if isinstance(reply_to, discord.Message) else message
+    msg = await message.channel.send(embed=embed, reference=ref_msg, mention_author=False)
+
+    # แนบไฟล์ฉบับเต็มถ้ายาว
     if is_truncated:
         from io import BytesIO
         bio = BytesIO((text or "").encode("utf-8"))
@@ -164,7 +191,7 @@ async def send_transcript(message: discord.Message, text: str,
         await message.channel.send(
             content="📎 **Full transcript (TXT)**",
             file=discord.File(bio, filename="transcript.txt"),
-            reference=message,           # 👈 reply ไปที่ข้อความเสียง
+            reference=ref_msg,
             mention_author=False,
         )
 
