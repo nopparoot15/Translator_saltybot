@@ -96,28 +96,45 @@ def register_message_handlers(bot):
                 a = audio_attachments[0]
                 filename = (a.filename or "").lower()
                 content_type = (a.content_type or "").lower()
-
+            
                 async def _run_stt_with_lang(interaction, base_lang_code: str):
                     """
                     ถอดเสียงตามภาษาที่ผู้ใช้เลือก
-                    - รอบ 1: strict เฉพาะ base_lang
-                    - รอบ 2: base + alts (เดาจากบริบท/ประวัติ)
-                    - รอบ 3: ถ้ายังไม่ได้ ลอง transcode เป็น WAV 16k mono แล้วรันอีกครั้ง
                     """
+                    # ===== NEW: สร้าง/อัปเดตข้อความสถานะระหว่างทำงาน =====
+                    # ธงภาษาสวย ๆ
+                    flag = FLAGS.get(base_lang_code, FLAGS.get(base_lang_code.split("-")[0], "")) or ""
+                    progress_msg = None
+            
+                    async def _status(msg: str):
+                        nonlocal progress_msg
+                        try:
+                            if progress_msg is None:
+                                progress_msg = await message.channel.send(
+                                    f"{flag} {msg} (`{base_lang_code}`)",
+                                    reference=message,  # ตอบกลับไปที่ข้อความไฟล์เสียง
+                                    mention_author=False,
+                                )
+                            else:
+                                await progress_msg.edit(content=f"{flag} {msg} (`{base_lang_code}`)")
+                        except Exception:
+                            pass
+            
                     try:
-                        # อ่านไฟล์จริงตอนนี้ (กันลิงก์หมดอายุในอนาคต)
+                        # อ่านไฟล์จริงตอนนี้
+                        await _status("กำลังเตรียมไฟล์เสียง…")
                         raw_bytes = await a.read()
                         if not raw_bytes:
-                            await message.channel.send("❌ ไม่สามารถอ่านไฟล์เสียงได้")
+                            await _status("❌ ไม่สามารถอ่านไฟล์เสียงได้")
                             return
-
+            
                         await increment_user_usage(message.author.id, message.guild.id)
-
+            
                         # ทำให้เข้ากับ STT
                         audio_bytes, fn, ctype, did_trans = await ensure_stt_compatible(filename, content_type, raw_bytes)
                         filename2, content_type2 = fn, ctype
-
-                        # alt ที่ช่วยเหลือ (ยกเว้น base เอง)
+            
+                        # เดา alts จากบริบท/ประวัติ
                         context_bias = detect_lang_hints_from_context(
                             username=str(message.author),
                             channel_name=getattr(message.channel, "name", "") or "",
@@ -130,12 +147,13 @@ def register_message_handlers(bot):
                             channel_hist=channel_hist, user_hist=user_hist,
                             context_bias=context_bias,
                         )
-
-                        # โหมดตามขนาด
+            
+                        # เลือกโหมด STT
                         use_long = len(audio_bytes) > 9_000_000
                         stt_mode = "google longrunning" if use_long else "google sync"
-
-                        # long-running ต้อง mono 16k → บังคับแปลงอีกชั้น (เผื่อยังไม่ mono)
+                        await _status(f"กำลังเริ่มถอดเสียง… (โหมด: {stt_mode})")
+            
+                        # longrunning → บังคับ mono 16k เผื่อหัวข้อ channel
                         if use_long:
                             try:
                                 audio_bytes = await transcode_to_wav_pcm16(
@@ -145,8 +163,9 @@ def register_message_handlers(bot):
                                 filename2 = f"{os.path.splitext(filename2)[0]}.wav"
                                 content_type2 = "audio/wav"
                             except Exception as e:
-                                logger.warning(f"[STT] force-mono for longrunning failed: {e}")
-
+                                # ไม่ล้มงาน แค่แจ้งเบา ๆ
+                                await _status("กำลังเริ่มถอดเสียง… (โหมด: google longrunning)")
+            
                         async def _run_once(alts):
                             if use_long:
                                 lr_kwargs = dict(
@@ -158,9 +177,10 @@ def register_message_handlers(bot):
                                     alternative_language_codes=(alts or [])[:3],
                                     poll=True,
                                     max_wait_sec=900.0,
+                                    # บอกให้ใช้ 1 แชนแนล
+                                    audio_channel_count=1,
+                                    enable_separate_recognition_per_channel=False,
                                 )
-                                # ชี้ว่ามี 1 แชนแนล
-                                lr_kwargs.update(audio_channel_count=1, enable_separate_recognition_per_channel=False)
                                 return await transcribe_long_audio_bytes(**lr_kwargs)
                             else:
                                 sync_kwargs = dict(
@@ -183,67 +203,82 @@ def register_message_handlers(bot):
                                     sync_kwargs.update(audio_channel_count=1,
                                                        enable_separate_recognition_per_channel=False)
                                 return await stt_transcribe_bytes(**sync_kwargs)
-
-                        # รอบ 1: strict (ไม่ส่ง alt)
+            
+                        # รอบ 1: strict
+                        await _status("กำลังถอดเสียง…")
                         text, raw = await _run_once(None)
-
-                        # ถ้า error API
+            
+                        # ถ้า error ฝั่ง API
                         if text.startswith("❌") or (isinstance(raw, dict) and raw.get("error")):
                             err_preview = ""
                             if isinstance(raw, dict):
-                                try:
-                                    err_preview = (raw.get("error") or "")[:400]
-                                except Exception:
-                                    pass
-                            await message.channel.send(f"{text}\n{err_preview}" if err_preview else text)
+                                try: err_preview = (raw.get("error") or "")[:400]
+                                except Exception: pass
+                            await _status("❌ ถอดเสียงไม่สำเร็จ")
+                            await message.channel.send(f"{text}\n{err_preview}" if err_preview else text,
+                                                       reference=message, mention_author=False)
                             return
-
-                        # รอบ 2: base + alts ถ้ายังว่าง
+            
+                        # รอบ 2: strict + alts
                         if not (text or "").strip():
+                            await _status("ยังไม่ได้ข้อความ ชั่งใจ… ลองอีกครั้งด้วยภาษาใกล้เคียง")
                             text2, raw2 = await _run_once(alt_smart)
                             if (text2 or "").strip():
                                 text, raw = text2, raw2
-
-                        # รอบ 3: แปลง WAV 16k mono แล้วลองใหม่ทั้ง strict/alt
+            
+                        # รอบ 3: transcode WAV แล้วลองอีก
                         if not (text or "").strip() and not did_trans:
                             try:
-                                audio_bytes = await transcode_to_wav_pcm16(raw_bytes, rate=16000, ch=1,
-                                                                           src_ext=os.path.splitext(a.filename or "")[1],
-                                                                           content_type=(a.content_type or ""))
+                                await _status("กำลังปรับรูปแบบเสียงใหม่ แล้วลองอีกครั้ง…")
+                                audio_bytes = await transcode_to_wav_pcm16(
+                                    raw_bytes, rate=16000, ch=1,
+                                    src_ext=os.path.splitext(a.filename or "")[1],
+                                    content_type=(a.content_type or "")
+                                )
                                 filename2 = f"{os.path.splitext(filename2)[0]}.wav"
                                 content_type2 = "audio/wav"
                                 use_long = len(audio_bytes) > 9_000_000
                                 stt_mode = "google longrunning" if use_long else "google sync"
+            
                                 t3, r3 = await _run_once(None)
                                 if not (t3 or "").strip():
                                     t4, r4 = await _run_once(alt_smart)
                                     text, raw = (t4, r4) if (t4 or "").strip() else (t3, r3)
                                 else:
                                     text, raw = t3, r3
-                            except Exception as e:
-                                logger.warning(f"[STT] second-chance transcode failed: {e}")
-
+                            except Exception:
+                                pass
+            
                         if not (text or "").strip():
-                            await message.channel.send("⚠️ ไม่พบข้อความจากเสียง (หรือเสียงไม่ชัดพอ)")
+                            await _status("⚠️ ไม่พบข้อความจากเสียง (หรือเสียงไม่ชัดพอ)")
                             return
-
-                        # อัปเดต histogram ให้ระบบเรียนรู้
+            
+                        # บันทึก histogram
                         try:
                             lang_seen = detect_script_from_text(text)
                             await incr_channel_lang_hist(message.channel.id, lang_seen)
                             await incr_user_lang_hist(message.author.id, lang_seen)
                         except Exception:
                             pass
-
-                        # ส่งผลลัพธ์ + ปุ่มฟัง/แปล
+            
+                        # ลบสถานะก่อนส่งผลลัพธ์จริง
+                        try:
+                            if progress_msg:
+                                await progress_msg.delete()
+                        except Exception:
+                            pass
+            
+                        # ส่ง Transcript (reply ไปที่ไฟล์ + โชว์โค้ดภาษาที่เลือก) + ไม่มี engine ในหัว STT
                         sent_msg = await send_transcript(
-                            message,           
+                            message,
                             text,
                             stt_tag=stt_mode,
-                            lang_display=code,   
-                            show_engine=False,   
-                            reply_to=message,    
+                            lang_display=base_lang_code,   # ✅ โชว์ว่าเลือกภาษาอะไร
+                            show_engine=False,             # ✅ ซ่อน engine สำหรับ STT
+                            reply_to=message,              # ✅ ตอบกลับไฟล์ต้นฉบับ
                         )
+            
+                        # แนบปุ่มฟัง/แปล
                         try:
                             view = OCRListenTranslateView(
                                 original_text=text,
@@ -255,16 +290,23 @@ def register_message_handlers(bot):
                             await sent_msg.edit(view=view)
                         except Exception:
                             pass
+            
                     except Exception as e:
+                        # ลบสถานะถ้ามี แล้วแจ้ง error ปกติ
+                        try:
+                            if progress_msg:
+                                await progress_msg.delete()
+                        except Exception:
+                            pass
                         logger.exception(f"❌ STT(multi) handler error: {e}")
-                        await message.channel.send("❌ เกิดข้อผิดพลาดระหว่างถอดเสียง")
-
-                # สร้าง/แสดงแผงเลือกภาษา
+                        await message.channel.send("❌ เกิดข้อผิดพลาดระหว่างถอดเสียง", reference=message, mention_author=False)
+            
+                # แสดงแผงเลือกภาษา
                 panel = STTLanguagePanel(
                     source_message=message,
                     on_choose_lang=_run_stt_with_lang,
                     flags=FLAGS,
-                    major_langs=["th", "en", "ja"],   # ปุ่มหลัก 3 ภาษาเหมือนเดิม
+                    major_langs=["th", "en", "ja"],
                     major_primary="th",
                 )
                 await panel.attach(message.channel)
