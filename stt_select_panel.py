@@ -4,11 +4,30 @@ import discord
 from typing import Callable, Optional, List, Tuple, Any
 from translate_panel import LANG_CHOICES, DEFAULT_MAJOR_LANGS  # ใช้รายการภาษา/ปุ่มหลักเดียวกับแผงแปล
 
+# ===== map โค้ด UI -> โค้ดสำหรับ Google STT (BCP-47) =====
+_STT_CODE_MAP = {
+    "th": "th-TH",
+    "en": "en-US",
+    "ja": "ja-JP",
+    "zh": "cmn-Hans-CN",   # UI 'zh' หรือ 'zh-CN' → จีนกลาง (ตัวย่อ)
+    "zh-CN": "cmn-Hans-CN",
+    "zh-TW": "cmn-Hant-TW",
+    "yue": "yue-Hant-HK",
+    "ko": "ko-KR",
+    "ru": "ru-RU",
+    "vi": "vi-VN",
+}
+
+def _to_stt_code(ui_code: str) -> str:
+    """คืนโค้ดภาษาสำหรับ Google STT (fallback → en-US)"""
+    c = (ui_code or "").strip()
+    return _STT_CODE_MAP.get(c, _STT_CODE_MAP.get(c.split("-")[0], "en-US"))
+
 # ===== ปุ่มหลัก 3 ภาษา =====
 class _MajorLangButton(discord.ui.Button):
     def __init__(self, code: str, label_text: str, style: discord.ButtonStyle):
         super().__init__(label=label_text, style=style, custom_id=f"stt_choose_{code}")
-        self.code = code
+        self.code = code  # โค้ด UI เช่น "th","en","ja","zh-CN"
 
     async def callback(self, interaction: discord.Interaction):
         view: STTLanguagePanel = self.view  # type: ignore
@@ -34,14 +53,14 @@ class _OtherLangsSelect(discord.ui.Select):
             if not interaction.response.is_done():
                 await interaction.response.defer()
             return
-        tgt = self.values[0]
-        await view._choose(interaction, tgt)
+        tgt_ui = self.values[0]
+        await view._choose(interaction, tgt_ui)
 
 # ===== View หลัก =====
 class STTLanguagePanel(discord.ui.View):
     """
     แผงถามภาษาพูดของไฟล์เสียง ก่อนเริ่ม STT
-    - on_choose_lang: Coroutine ที่รับ (interaction, lang_code) แล้วไปถอดเสียง
+    - on_choose_lang: Coroutine ที่รับ (interaction, stt_lang_code) แล้วไปถอดเสียง
     - flags: map code -> ธง (เช่น {"th": "🇹🇭"})
     """
     def __init__(
@@ -89,35 +108,36 @@ class STTLanguagePanel(discord.ui.View):
             mention_author=False,
         )
 
-    async def _choose(self, interaction: discord.Interaction, code: str):
+    async def _choose(self, interaction: discord.Interaction, ui_code: str):
+        """เมื่อผู้ใช้เลือกภาษา → ลบแผง แล้วส่งโค้ด BCP-47 ให้ callback ถอดเสียง"""
         self.processing = True
-    
-        # ✅ รับ interaction ไว้ก่อน กัน timeout
+
+        # รับ interaction กัน timeout
         try:
             if not interaction.response.is_done():
                 await interaction.response.defer()
         except Exception:
             pass
-    
-        # ✅ พยายามลบข้อความแผงเลือกภาษาออกเลย
+
+        # ลบกล่องเลือกภาษา
         try:
             picker_msg = interaction.message or getattr(self, "frame_message", None)
             if isinstance(picker_msg, discord.Message):
                 await picker_msg.delete()
         except Exception:
-            # ถ้าลบไม่ได้ ให้ปิดปุ่มและแสดงสถานะสั้น ๆ แทน
+            # ถ้าลบไม่ได้ให้ปิดปุ่มและแสดงสถานะแทน (ไม่บังคับ)
             try:
                 for child in self.children:
                     child.disabled = True
                 await interaction.message.edit(
-                    content=f"⏳ Transcribing… (`{code}` selected)", view=self
+                    content=f"⏳ Transcribing… (`{ui_code}` selected)", view=self
                 )
             except Exception:
                 pass
-    
-        # ▶️ ถอดเสียงตามภาษาที่เลือก (callback ภายนอกจะเป็นคนส่ง transcript แบบ reply)
+
+        # ส่งต่อให้ handler ด้วยโค้ด STT ที่แปลงแล้ว
+        stt_code = _to_stt_code(ui_code)
         try:
-            await self.on_choose_lang(interaction, code)
+            await self.on_choose_lang(interaction, stt_code)
         finally:
             self.stop()
-
