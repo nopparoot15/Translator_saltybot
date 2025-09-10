@@ -1,4 +1,6 @@
+# events.py
 import os
+import re
 import logging
 
 from constants import (
@@ -11,8 +13,11 @@ from translation_service import translate_with_provider, engine_label_for_messag
 from messaging_utils import send_long_message
 
 from ocr_service import ocr_google_vision_api_key
-from app_redis import increment_user_usage, get_channel_lang_hist, get_user_lang_hist, incr_channel_lang_hist, incr_user_lang_hist
-from media_utils import ensure_stt_compatible
+from app_redis import (
+    increment_user_usage, get_channel_lang_hist, get_user_lang_hist,
+    incr_channel_lang_hist, incr_user_lang_hist
+)
+from media_utils import ensure_stt_compatible, transcode_to_wav_pcm16
 from stt_google_sync import stt_transcribe_bytes
 from stt_google_async import transcribe_long_audio_bytes
 from stt_lang_utils import (
@@ -26,6 +31,42 @@ from tts_service import speak_text_multi
 from config import GOOGLE_API_KEY, GCS_BUCKET_NAME
 
 logger = logging.getLogger(__name__)
+
+
+def _choose_base_lang(
+    *,
+    default_base: str,
+    context_bias: dict,
+    user_hist: dict | None,
+    channel_hist: dict | None,
+    filename: str,
+    caption: str,
+) -> str:
+    """
+    เลือก base_lang แบบไดนามิกจากสัญญาณรวม:
+    - ฮินต์แรงจากชื่อไฟล์/แคปชันที่มี ฮิระ/คาตะ/คันจิ -> บังคับ ja-JP
+    - รวมคะแนน context_bias + ประวัติ user/channel
+    - ถ้าคะแนนรวมสูงพอ ให้ใช้ภาษานั้นเป็น base; ไม่งั้น fallback เป็น default_base
+    """
+    blob = (filename or "") + " " + (caption or "")
+    if re.search(r"[\u3040-\u30FF\u4E00-\u9FFF]", blob):
+        return "ja-JP"
+
+    user_hist = user_hist or {}
+    channel_hist = channel_hist or {}
+
+    candidates = ["th-TH", "ja-JP", "cmn-Hans-CN", "ko-KR", "ru-RU", "vi-VN", "en-US"]
+
+    def score(lang: str) -> float:
+        return (
+            float(context_bias.get(lang, 0.0))
+            + 1.4 * float(user_hist.get(lang, 0))
+            + 0.8 * float(channel_hist.get(lang, 0))
+        )
+
+    winner = max(candidates, key=score)
+    return winner if score(winner) >= 1.0 else default_base
+
 
 def register_message_handlers(bot):
     @bot.listen("on_message")
@@ -106,20 +147,31 @@ def register_message_handlers(bot):
 
                         await increment_user_usage(message.author.id, message.guild.id)
 
+                        # 1) ทำให้ไฟล์เข้ากับ STT เสมอ
                         audio_bytes, filename2, content_type2, did_trans = await ensure_stt_compatible(
                             filename, content_type, raw_bytes
                         )
                         filename, content_type = filename2, content_type2
 
-                        base_lang = "th-TH"
+                        # 2) คำนวณ base_lang แบบไดนามิก (สำคัญมาก)
                         context_bias = detect_lang_hints_from_context(
                             username=str(message.author),
                             channel_name=getattr(message.channel, "name", "") or "",
                             caption_text=(message.content or ""),
                         )
                         channel_hist = await get_channel_lang_hist(message.channel.id)
-                        user_hist    = await get_user_lang_hist(message.author.id)
+                        user_hist = await get_user_lang_hist(message.author.id)
 
+                        base_lang = _choose_base_lang(
+                            default_base="th-TH",
+                            context_bias=context_bias,
+                            user_hist=user_hist,
+                            channel_hist=channel_hist,
+                            filename=filename,
+                            caption=message.content or "",
+                        )
+
+                        # 3) alternative languages
                         alt_smart = pick_alternative_langs(
                             base_lang=base_lang, max_alts=3,
                             channel_hist=channel_hist, user_hist=user_hist,
@@ -131,6 +183,7 @@ def register_message_handlers(bot):
                             exclude_in_fallback=None, per_round_limit=3,
                         )
 
+                        # 4) เลือกโหมด STT
                         use_long = len(audio_bytes) > 9_000_000
                         stt_mode = "google longrunning" if use_long else "google sync"
 
@@ -178,30 +231,50 @@ def register_message_handlers(bot):
                                                        enable_separate_recognition_per_channel=False)
                                 return await stt_transcribe_bytes(**sync_kwargs)
 
+                        # ---- Attempt 1 (strict-first) ----
                         text, raw = await _run_stt_once(alt_round1)
 
+                        # error ฝั่ง API
                         if text.startswith("❌") or (isinstance(raw, dict) and raw.get("error")):
                             err_preview = ""
                             if isinstance(raw, dict):
-                                try: err_preview = (raw.get("error") or "")[:400]
-                                except Exception: pass
+                                try:
+                                    err_preview = (raw.get("error") or "")[:400]
+                                except Exception:
+                                    pass
                             await message.channel.send(f"{text}\n{err_preview}" if err_preview else text)
                             return
 
                         def _looks_thai(s: str) -> bool:
                             return any("\u0E00" <= ch <= "\u0E7F" for ch in (s or ""))
 
-                        need_retry = (not text.strip()) or (stt_mode.startswith("google") and not _looks_thai(text) and base_lang=="th-TH")
+                        # ---- Attempt 2 (fallback alts) ----
+                        need_retry = (not text.strip()) or (
+                            stt_mode.startswith("google")
+                            and base_lang == "th-TH"
+                            and not _looks_thai(text)
+                        )
                         if need_retry:
                             text2, raw2 = await _run_stt_once(alt_round2)
                             if text2.strip():
                                 text, raw = text2, raw2
 
+                        # ---- Second chance: force transcode → WAV แล้วลองใหม่ ----
                         if (not text.strip()) and (not did_trans):
                             try:
-                                audio_bytes = await ensure_stt_compatible(a.filename or "", a.content_type or "", raw_bytes)[0]
+                                orig_ext = (os.path.splitext(a.filename or "")[1] or "").lower()
+                                orig_ct = (a.content_type or "").lower()
+
+                                audio_bytes = await transcode_to_wav_pcm16(
+                                    raw_bytes, rate=16000, ch=1,
+                                    src_ext=orig_ext, content_type=orig_ct
+                                )
+                                filename = f"{os.path.splitext(filename)[0]}.wav"
+                                content_type = "audio/wav"
+
                                 use_long = len(audio_bytes) > 9_000_000
                                 stt_mode = "google longrunning" if use_long else "google sync"
+
                                 t3, r3 = await _run_stt_once(alt_round1)
                                 if not t3.strip():
                                     t4, r4 = await _run_stt_once(alt_round2)
@@ -215,6 +288,7 @@ def register_message_handlers(bot):
                             await message.channel.send("⚠️ ไม่พบข้อความจากเสียง (หรือเสียงไม่ชัดพอ)")
                             return
 
+                        # อัปเดตสถิติภาษา (เรียนรู้)
                         try:
                             lang_seen = detect_script_from_text(text)
                             await incr_channel_lang_hist(message.channel.id, lang_seen)
@@ -222,7 +296,12 @@ def register_message_handlers(bot):
                         except Exception:
                             pass
 
-                        sent_msg = await send_transcript(message, text, engine_label_for_message, stt_mode)
+                        # ส่ง Transcript + ปุ่ม
+                        sent_msg = await send_transcript(
+                            message, text,
+                            engine_label_provider=engine_label_for_message,
+                            stt_tag=stt_mode,
+                        )
                         try:
                             view = OCRListenTranslateView(
                                 original_text=text,
