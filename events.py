@@ -237,12 +237,12 @@ def register_message_handlers(bot):
 
                         # ส่งผลลัพธ์ + ปุ่มฟัง/แปล
                         sent_msg = await send_transcript(
-                            message,
+                            message,           
                             text,
                             stt_tag=stt_mode,
-                            lang_display=selected_code, 
-                            show_engine=False,            
-                            reply_to=message,             
+                            lang_display=code,   
+                            show_engine=False,   
+                            reply_to=message,    
                         )
                         try:
                             view = OCRListenTranslateView(
