@@ -139,7 +139,7 @@ async def send_transcript(message: discord.Message, text: str,
 
     # --- preview (กันล้น embed) ---
     safe_text = (text or "").replace("```", "``\u200b`")
-    PREVIEW_MAX = 1800   # เผื่อ head/foot ใน embed
+    PREVIEW_MAX = 1800
     is_truncated = len(safe_text) > PREVIEW_MAX
     preview = safe_text[:PREVIEW_MAX] + ("…" if is_truncated else "")
 
@@ -151,17 +151,21 @@ async def send_transcript(message: discord.Message, text: str,
     if is_truncated:
         desc += "\n_(ข้อความยาว – แนบไฟล์ฉบับเต็มไว้ให้แล้ว)_"
     embed.description = desc
+    msg = await message.channel.send(
+        embed=embed,
+        reference=message,
+        mention_author=False,
+    )
 
-    # ส่ง embed ก่อน (ปุ่มต่าง ๆ จะถูก edit ใส่ทีหลังเหมือนเดิม)
-    msg = await message.channel.send(embed=embed)
-
-    # --- แนบไฟล์ฉบับเต็มถ้ายาว ---
     if is_truncated:
+        from io import BytesIO
         bio = BytesIO((text or "").encode("utf-8"))
         bio.seek(0)
         await message.channel.send(
             content="📎 **Full transcript (TXT)**",
-            file=discord.File(bio, filename="transcript.txt")
+            file=discord.File(bio, filename="transcript.txt"),
+            reference=message,           # 👈 reply ไปที่ข้อความเสียง
+            mention_author=False,
         )
 
     return msg
