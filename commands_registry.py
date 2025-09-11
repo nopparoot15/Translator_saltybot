@@ -3,7 +3,7 @@ from discord.ext import commands
 from datetime import datetime, timedelta
 
 from lang_config import FLAGS
-from constants import GOOGLE_TRANSLATE_DAILY_LIMIT, OCR_DAILY_LIMIT
+from constants import GOOGLE_TRANSLATE_DAILY_LIMIT, OCR_DAILY_LIMIT, EXEMPT_USER_IDS
 from app_redis import (
     get_gtrans_used_today,
     get_ocr_quota_remaining,
