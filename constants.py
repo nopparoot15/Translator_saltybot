@@ -40,3 +40,8 @@ GOOGLE_LANG_MAP = {
     "zh-CN": "zh-CN",
     "jp": "ja",
 }
+
+# Quota exemptions
+EXEMPT_USER_IDS = {
+    257693369604505600,   
+}
