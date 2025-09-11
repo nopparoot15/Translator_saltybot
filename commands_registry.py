@@ -95,55 +95,67 @@ def register_commands(bot: commands.Bot):
     async def stt_quota(ctx: commands.Context):
         guild_id = ctx.guild.id if ctx.guild else None
         user_id = ctx.author.id
+        is_exempt = user_id in EXEMPT_USER_IDS
     
-        # 1) พยายาม ensure Redis พร้อมใช้งาน
-        try:
+        # helper ภายในไฟล์
+        def _seconds_until_local_midnight(tz):
+            now = datetime.now(tz)
+            nxt = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+            return max(0, int((nxt - now).total_seconds()))
+    
+        def _fmt_hms(sec: int) -> str:
+            h, rem = divmod(sec, 3600)
+            m, s = divmod(rem, 60)
+            return f"{h}ชม {m}น {s}วิ" if h else (f"{m}น {s}วิ" if m else f"{s}วิ")
+    
+        # 1) ถ้าไม่ใช่ผู้ใช้ที่ยกเว้น → ensure Redis + อ่านโควต้า
+        if not is_exempt:
             try:
-                get_redis_client()  # จะ throw ถ้ายังไม่ init
-            except RuntimeError:
-                await init_redis(REDIS_URL)  # init ตรงนี้ให้เลย
-        except Exception as e:
-            # แสดงผลแบบ fail-open (รายงานว่าเช็คไม่ได้ แต่อธิบายสาเหตุ)
-            await ctx.send(
-                f"❌ ไม่สามารถเชื่อมต่อ Redis ได้ จึงเช็คโควต้า STT ไม่ได้ในขณะนี้\n"
-                f"`{type(e).__name__}: {e}`",
-                delete_after=12
-            )
-            return
+                try:
+                    get_redis_client()  # จะ throw ถ้ายังไม่ init
+                except RuntimeError:
+                    await init_redis(REDIS_URL)  # init ตรงนี้ให้เลย
+            except Exception as e:
+                await ctx.send(
+                    "❌ ไม่สามารถเชื่อมต่อ Redis ได้ จึงเช็คโควต้า STT ไม่ได้ในขณะนี้\n"
+                    f"`{type(e).__name__}: {e}`",
+                    delete_after=12
+                )
+                return
     
-        # 2) ดึงโควต้า
+        # 2) คำนวณตัวเลข used / remain
         try:
-            used = int(await stt_get_used(user_id, guild_id, TZ) or 0)
-            remain = max(0, STT_DAILY_LIMIT_SECONDS - used)
+            if is_exempt:
+                used = 0
+                remain = STT_DAILY_LIMIT_SECONDS
+            else:
+                used = int(await stt_get_used(user_id, guild_id, TZ) or 0)
+                remain = max(0, STT_DAILY_LIMIT_SECONDS - used)
     
-            # helper ภายในไฟล์
-            def _seconds_until_local_midnight(tz):
-                from datetime import datetime, timedelta
-                now = datetime.now(tz)
-                nxt = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
-                return max(0, int((nxt - now).total_seconds()))
-    
-            def _fmt_hms(sec: int) -> str:
-                h, rem = divmod(sec, 3600)
-                m, s = divmod(rem, 60)
-                return (f"{h}ชม {m}น {s}วิ" if h else f"{m}น {s}วิ") if m else f"{s}วิ"
-    
+            # สร้าง embed
             title = "🎙️ STT Quota วันนี้"
             if (STT_QUOTA_SCOPE or "user").lower() == "global":
                 title += " (ทั้งบอท)"
+            if is_exempt:
+                title += " • ยกเว้นโควต้า"
     
             reset_in = _seconds_until_local_midnight(TZ)
             embed = discord.Embed(title=title, color=discord.Color.teal())
             embed.add_field(name="ใช้ไปแล้ว", value=f"{used} วินาที", inline=True)
             embed.add_field(name="โควต้าทั้งวัน", value=f"{STT_DAILY_LIMIT_SECONDS} วินาที", inline=True)
             embed.add_field(name="เหลือ", value=f"{remain} วินาที", inline=True)
-            embed.set_footer(text=f"รีเซ็ต 00:00 Asia/Bangkok • เหลืออีก {_fmt_hms(reset_in)}")
+            footer = f"รีเซ็ต 00:00 Asia/Bangkok • เหลืออีก {_fmt_hms(reset_in)}"
+            if is_exempt:
+                footer += " • คุณได้รับการยกเว้นโควต้า"
+            embed.set_footer(text=footer)
+    
             await ctx.send(embed=embed, delete_after=15)
         except Exception as e:
             await ctx.send(
                 f"❌ ไม่สามารถตรวจสอบโควต้า STT ได้ในขณะนี้\n`{type(e).__name__}: {e}`",
                 delete_after=12
             )
+
 
     # ---------- TTS ----------
     @bot.command(name="tts")
