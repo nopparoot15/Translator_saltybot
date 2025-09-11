@@ -200,7 +200,10 @@ async def translate_with_provider(
         n_chars = len(src_text)
         today = datetime.now().strftime("%Y-%m-%d")
         ok, reason = await check_and_increment_gtranslate_quota(
-            n_chars=n_chars, date_str=today, daily_limit=GOOGLE_TRANSLATE_DAILY_LIMIT,
+            n_chars=len(text),
+            date_str=today_str,
+            daily_limit=GOOGLE_TRANSLATE_DAILY_LIMIT,
+            user_id=message.author.id,
         )
         if not ok:
             if reason == "exceeded":
