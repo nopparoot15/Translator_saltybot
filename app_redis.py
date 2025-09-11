@@ -12,6 +12,18 @@ except Exception:
     redis = None  # จะ raise ตอน init_redis ถ้า lib ไม่พร้อม
     ResponseError = Exception  # fallback
 
+# ===== constants for exemptions =====
+try:
+    from constants import EXEMPT_USER_IDS
+except Exception:
+    EXEMPT_USER_IDS = set()
+
+def _is_exempt(user_id: Optional[int]) -> bool:
+    try:
+        return int(user_id) in EXEMPT_USER_IDS if user_id is not None else False
+    except Exception:
+        return False
+
 # ============================================================
 # Module State
 # ============================================================
@@ -20,7 +32,7 @@ _redis = None  # type: Optional["redis.Redis"]
 _lua_reserve_sha: Optional[str] = None  # cached SHA ของสคริปต์ Lua (อะตอมมิก reserve)
 
 # ============================================================
-# Keys / TTL (เดิม)
+# Keys / TTL
 # ============================================================
 
 LANG_HIST_TTL_SECONDS = 60 * 60 * 24 * 30  # 30 วัน
@@ -49,12 +61,14 @@ def _key_gtrans_global(date_str: str) -> str:
     return f"gtrans_usage:global:{date_str}"
 
 # ============================================================
-# STT Daily-Seconds Quota (ใหม่)
+# STT Daily-Seconds Quota (รองรับ user/guild_user/global)
 # ============================================================
 
-# รูปแบบกุญแจ: stt:sec:YYYYMMDD:{user_id}  หรือ  stt:sec:YYYYMMDD:{guild_id}:{user_id}
-# เลือกสโคปด้วย ENV STT_QUOTA_SCOPE = "user" (ค่าเริ่มต้น) หรือ "guild_user"
-_STT_SCOPE = os.getenv("STT_QUOTA_SCOPE", "user").strip().lower()  # "user" | "guild_user"
+# รูปแบบคีย์:
+# - per-user:      stt:sec:YYYYMMDD:{user_id}
+# - per-guilduser: stt:sec:YYYYMMDD:{guild_id}:{user_id}
+# - global:        stt:sec:YYYYMMDD:global
+_STT_SCOPE = os.getenv("STT_QUOTA_SCOPE", "user").strip().lower()  # "user" | "guild_user" | "global"
 
 def _local_datestr(tz: ZoneInfo) -> str:
     return datetime.now(tz).strftime("%Y%m%d")
@@ -88,7 +102,8 @@ end
 """
 
 async def _ensure_lua_loaded():
-    global _lua_reserve_sha, _redis
+    """โหลดสคริปต์ Lua ลง Redis หนึ่งครั้งต่อโปรเซส"""
+    global _lua_reserve_sha
     if _lua_reserve_sha or _redis is None:
         return
     try:
@@ -96,14 +111,29 @@ async def _ensure_lua_loaded():
     except Exception:
         _lua_reserve_sha = None  # ให้ค่อย eval ได้ภายหลัง
 
-async def stt_try_reserve(user_id: int, guild_id: Optional[int], seconds: int, daily_limit: int, tz: ZoneInfo) -> bool:
+async def stt_try_reserve(
+    user_id: int,
+    guild_id: Optional[int],
+    seconds: int,
+    daily_limit: int,
+    tz: ZoneInfo
+) -> bool:
+    """
+    พยายาม "จอง" วินาที STT แบบอะตอมมิกก่อนเริ่มถอดเสียง
+    - ผู้ใช้ที่อยู่ใน EXEMPT_USER_IDS: ข้ามการนับ -> True ทันที
+    - สำเร็จ (ยังไม่เกินลิมิต): return True
+    - เกินลิมิต: return False
+    - Redis ล่ม: fail-open -> True
+    """
+    if _is_exempt(user_id):
+        return True
     if _redis is None:
-        return True  # fail-open
+        return True
     try:
         await _ensure_lua_loaded()
         date_str = _local_datestr(tz)
         key = _key_stt_seconds(date_str, user_id, guild_id)
-        ttl = _seconds_until_local_midnight(tz) + 60
+        ttl = _seconds_until_local_midnight(tz) + 60  # กันเผื่อ 1 นาที
         if _lua_reserve_sha:
             try:
                 res = await _redis.evalsha(_lua_reserve_sha, 1, key, daily_limit, int(seconds), ttl)
@@ -116,7 +146,10 @@ async def stt_try_reserve(user_id: int, guild_id: Optional[int], seconds: int, d
         return True
 
 async def stt_refund(user_id: int, guild_id: Optional[int], seconds: int, tz: ZoneInfo) -> None:
-    if _redis is None:
+    """
+    คืนวินาทีที่จองไว้ (กรณี STT ล้มเหลว) — ผู้ใช้ exempt: ไม่ทำอะไร
+    """
+    if _is_exempt(user_id) or _redis is None:
         return
     try:
         date_str = _local_datestr(tz)
@@ -132,11 +165,11 @@ async def stt_refund(user_id: int, guild_id: Optional[int], seconds: int, tz: Zo
 
 async def stt_get_used(user_id: int, guild_id: Optional[int], tz: ZoneInfo) -> int:
     """
-    คืนจำนวนวินาทีที่ใช้แล้ววันนี้
+    คืนจำนวนวินาทีที่ใช้ไปแล้ววันนี้
+    - ผู้ใช้ exempt: คืน 0 เสมอ (ถือว่ายังเหลือเต็ม)
     - โหมด global: คืนค่ารวมทั้งบอท
-    - โหมดอื่น: คืนค่าตาม key ของ user / guild_user
     """
-    if _redis is None:
+    if _is_exempt(user_id) or _redis is None:
         return 0
     try:
         date_str = _local_datestr(tz)
@@ -199,7 +232,7 @@ async def _set_json(key: str, obj: dict, ttl: Optional[int] = None):
         pass
 
 # ============================================================
-# Google Translate — Global Quota (เดิม)
+# Google Translate — Global Quota (รองรับ exempt)
 # ============================================================
 
 async def get_gtrans_used_today(date_str: str) -> int:
@@ -214,13 +247,18 @@ async def get_gtrans_used_today(date_str: str) -> int:
 async def check_and_increment_gtranslate_quota(
     n_chars: int,
     date_str: str,
-    daily_limit: int = 15000
+    daily_limit: int = 15000,
+    user_id: Optional[int] = None,   # <-- NEW: รองรับ exempt
 ) -> tuple[bool, Optional[str]]:
     """
     คืน (ok, reason)
-      - (True, None)     → บันทึกโควต้าแล้ว ใช้งานได้
+      - (True, None)                → บันทึกโควต้าแล้ว หรือผู้ใช้เป็น exempt
       - (False, "exceeded"|"redis") → ใช้ไม่ได้ เพราะเกินโควต้าหรือ Redis ล่ม
+    หมายเหตุ: ถ้า user_id อยู่ใน EXEMPT_USER_IDS จะ "ไม่บวก" เคาน์เตอร์ global
     """
+    if _is_exempt(user_id):
+        return True, None
+
     r = get_redis_client()
     key = _key_gtrans_global(date_str)
     try:
@@ -235,7 +273,7 @@ async def check_and_increment_gtranslate_quota(
         return False, "redis"
 
 # ============================================================
-# OCR — Daily counters (global/user/guild) (เดิม)
+# OCR — Daily counters (global/user/guild) (รองรับ exempt)
 # ============================================================
 
 async def check_and_increment_ocr_usage(
@@ -247,7 +285,11 @@ async def check_and_increment_ocr_usage(
     """
     global limit รายวัน: ถ้าถึงเพดาน -> return False
     อัปเดตนับ global/user/guild พร้อม TTL
+    ผู้ใช้ exempt: ข้ามการนับทั้งหมด -> True
     """
+    if _is_exempt(user_id):
+        return True
+
     r = get_redis_client()
     g_key = _key_ocr_global(date_str)
     u_key = _key_ocr_user(user_id, date_str)
@@ -261,23 +303,21 @@ async def check_and_increment_ocr_usage(
             return False
 
         # เพิ่มตัวนับ
-        await r.incr(g_key)
-        await r.expire(g_key, OCR_TTL_SECONDS)
-
-        await r.incr(u_key)
-        await r.expire(u_key, OCR_TTL_SECONDS)
-
-        await r.incr(d_key)
-        await r.expire(d_key, OCR_TTL_SECONDS)
-
+        await r.incr(g_key);  await r.expire(g_key, OCR_TTL_SECONDS)
+        await r.incr(u_key);  await r.expire(u_key, OCR_TTL_SECONDS)
+        await r.incr(d_key);  await r.expire(d_key, OCR_TTL_SECONDS)
         return True
     except Exception:
         return False
 
 async def get_ocr_quota_remaining(user_id: int, date_str: str, per_user_limit: int = 30) -> int:
     """
-    เหลือโควต้าผู้ใช้ต่อวัน (ถ้า Redis ล่ม -> -1)
+    เหลือโควต้าผู้ใช้ต่อวัน
+    - ผู้ใช้ exempt: คืน per_user_limit (ถือว่าเหลือเต็ม)
+    - Redis ล่ม -> -1
     """
+    if _is_exempt(user_id):
+        return per_user_limit
     r = get_redis_client()
     key = _key_ocr_user(user_id, date_str)
     try:
@@ -288,7 +328,7 @@ async def get_ocr_quota_remaining(user_id: int, date_str: str, per_user_limit: i
         return -1
 
 # ============================================================
-# Usage counters (leaderboard) (เดิม)
+# Usage counters (leaderboard) — ไม่ถือเป็น "quota" เลยไม่นับ exempt
 # ============================================================
 
 async def increment_user_usage(user_id: int, guild_id: int) -> None:
@@ -299,9 +339,6 @@ async def increment_user_usage(user_id: int, guild_id: int) -> None:
         pass
 
 async def get_top_users(guild_id: int, top_n: int = 10) -> List[Tuple[int, int]]:
-    """
-    คืน [(user_id, count), ...] มากสุด top_n
-    """
     r = get_redis_client()
     prefix = f"usage:{int(guild_id)}:"
     try:
@@ -321,7 +358,7 @@ async def get_top_users(guild_id: int, top_n: int = 10) -> List[Tuple[int, int]]
         return []
 
 # ============================================================
-# STT language hist (per channel / per user) (เดิม)
+# STT language hist (per channel / per user)
 # ============================================================
 
 async def get_channel_lang_hist(channel_id: int) -> Dict[str, int]:
