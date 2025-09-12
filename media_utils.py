@@ -193,20 +193,18 @@ async def download_to_temp(attachment) -> str:
     return tmp_path
 
 async def probe_duration_seconds(path: str) -> int:
-    """
-    ใช้ ffprobe วัดความยาวสื่อ (วินาที, ปัดขึ้น) — ถ้าอ่านไม่ได้คืน 0
-    """
     try:
-        cmd = [
-            "ffprobe", "-v", "error",
-            "-show_entries", "format=duration",
-            "-of", "default=noprint_wrappers=1:nokey=1",
-            path,
-        ]
+        cmd = ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+               "-of", "default=noprint_wrappers=1:nokey=1", path]
         out, err, rc = await _run_cmd(cmd, stdin=None)
         if rc != 0:
             return 0
         val = (out.decode("utf-8", "ignore") if isinstance(out, (bytes, bytearray)) else str(out)).strip()
+        if not val:
+            return 0
         return max(0, int(math.ceil(float(val))))
+    except FileNotFoundError:
+        # ffprobe ไม่อยู่ใน PATH
+        return 0
     except Exception:
         return 0
