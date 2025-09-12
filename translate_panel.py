@@ -15,6 +15,7 @@ LANG_CHOICES: List[Tuple[str, str]] = [
     ("zh-CN", "Chinese"),
     ("ko", "Korean"),
     ("vi", "Vietnamese"),
+    ("fil", "Filipino"),
     ("id", "Indonesian"),
     ("hi", "Hindi"),
     ("km", "Khmer"),
@@ -230,6 +231,8 @@ def _norm_lang(code: Optional[str]) -> str:
         return "zh-CN"
     if cl in ("ja", "ja-jp", "ja_jp"):
         return "ja"
+    if cl in ("fil", "fil-ph", "tl", "tl-ph"):
+        return "fil"
     # ค่าอย่าง en-GB → เอา base 'en' ก็พอสำหรับ TTS ส่วนใหญ่
     return c.split("-")[0]
     
