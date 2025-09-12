@@ -39,7 +39,11 @@ GOOGLE_LANG_MAP = {
     "zh": "zh-CN",
     "zh-CN": "zh-CN",
     "jp": "ja",
+    "fil": "tl",
+    "fil-PH": "tl",
+    "tl-PH": "tl",
 }
+
 
 # Quota exemptions
 EXEMPT_USER_IDS = {
