@@ -1,4 +1,3 @@
-# tts_service.py
 import os
 import asyncio
 from uuid import uuid4
@@ -78,7 +77,9 @@ async def speak_text(message: discord.Message, text: str, lang: str = "auto") ->
                 if requested == "auto":
                     requested = resolve_tts_code(speak_text_value, "auto")
 
+                # ใช้ normalize_gtts_lang() ที่รองรับ fil/fil-PH/tl-PH → tl
                 gtts_key, display_code = normalize_gtts_lang(requested)
+
                 filename = f"tts_{uuid4().hex}.mp3"
                 gTTS(text=speak_text_value, lang=gtts_key).save(filename)
 
@@ -135,6 +136,8 @@ async def speak_text_multi(
                 pref_sanitized = sanitize_requested_lang(pref)
                 if pref_sanitized and pref_sanitized.lower() != "auto":
                     requested_lang = pref_sanitized
+
+            # ใช้ normalize_gtts_lang() ที่รองรับ fil/fil-PH/tl-PH → tl
             gtts_key, display_code = normalize_gtts_lang(requested_lang)
 
             filename = f"tts_{uuid4().hex}.mp3"
