@@ -32,7 +32,7 @@ from tts_lang_resolver import (
 )
 from tts_service import speak_text_multi
 from config import GOOGLE_API_KEY, GCS_BUCKET_NAME, STT_DAILY_LIMIT_SECONDS, TZ
-from stt_select_panel import STTLanguagePanel  # แผงเลือกภาษา STT
+from stt_select_panel import STTLanguagePanel, _to_stt_code
 
 logger = logging.getLogger(__name__)
 
@@ -173,11 +173,14 @@ def register_message_handlers(bot):
                         )
                         channel_hist = await get_channel_lang_hist(message.channel.id)
                         user_hist    = await get_user_lang_hist(message.author.id)
-                        alt_smart = pick_alternative_langs(
-                            base_lang=base_lang_code, max_alts=3,
+                        iso_base = (base_lang_code or "").split("-")[0]
+                        alt_iso = pick_alternative_langs(
+                            base_lang=iso_base, max_alts=3,
                             channel_hist=channel_hist, user_hist=user_hist,
                             context_bias=context_bias,
                         )
+
+                        alt_bcp = [_to_stt_code(c) for c in (alt_iso or [])[:3]]
 
                         # เลือกโหมดจากขนาดไฟล์ (ประมาณ)
                         use_long = len(audio_bytes) > 9_000_000
@@ -198,6 +201,9 @@ def register_message_handlers(bot):
                                 pass
 
                         async def _run_once(alts):
+                            # แปลง ISO → BCP-47 ตรงนี้
+                            alts_bcp = [_to_stt_code(c) for c in (alts or [])[:3]]
+                        
                             if use_long:
                                 lr_kwargs = dict(
                                     audio_bytes=audio_bytes,
@@ -205,7 +211,7 @@ def register_message_handlers(bot):
                                     content_type=content_type2 or None,
                                     bucket_name=GCS_BUCKET_NAME,
                                     lang_hint=base_lang_code,
-                                    alternative_language_codes=(alts or [])[:3],
+                                    alternative_language_codes=alts_bcp,   # ใช้ตัวนี้ "ครั้งเดียว"
                                     poll=True,
                                     max_wait_sec=900.0,
                                     audio_channel_count=1,
@@ -219,7 +225,7 @@ def register_message_handlers(bot):
                                     filename=a.filename,
                                     content_type=content_type2,
                                     lang_hint=base_lang_code,
-                                    alternative_language_codes=(alts or [])[:3],
+                                    alternative_language_codes=alts_bcp,   # ใช้ตัวนี้ "ครั้งเดียว"
                                     enable_punctuation=True,
                                     max_alternatives=1,
                                     timeout_s=90.0,
@@ -258,7 +264,7 @@ def register_message_handlers(bot):
                         # รอบ 2: strict + alts
                         if not (text or "").strip():
                             await _status("ยังไม่ได้ข้อความ ลองอีกครั้งด้วยภาษาใกล้เคียง…")
-                            text2, raw2 = await _run_once(alt_smart)
+                            text2, raw2 = await _run_once(alt_iso)
                             if (text2 or "").strip():
                                 text, raw = text2, raw2
 
@@ -281,7 +287,7 @@ def register_message_handlers(bot):
 
                                 t3, r3 = await _run_once(None)
                                 if not (t3 or "").strip():
-                                    t4, r4 = await _run_once(alt_smart)
+                                    t4, r4 = await _run_once(alt_iso)
                                     text, raw = (t4, r4) if (t4 or "").strip() else (t3, r3)
                                 else:
                                     text, raw = t3, r3
