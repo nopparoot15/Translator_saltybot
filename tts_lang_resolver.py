@@ -46,15 +46,23 @@ def sanitize_requested_lang(req: str | None) -> str:
         return "auto"
     return req
 
-# gTTS languages (บางอันต้อง map)
+# gTTS languages normalize (ปรับให้เป็น lowercase key ทั้งหมด + รองรับ Filipino/Tagalog)
 _GTTs_NORMALIZE = {
+    # Chinese
     "zh": "zh-CN",
     "zh-cn": "zh-CN",
-    "zh_CN": "zh-CN",
-    "zh-TW": "zh-TW",
+    "zh_cn": "zh-CN",
+    "zh-tw": "zh-TW",
+    "zh_tw": "zh-TW",
+    # Japanese alias
     "jp": "ja",
+    # Portuguese (Brazil → pt)
     "pt-br": "pt",
-    "pt_BR": "pt",
+    "pt_br": "pt",
+    # Filipino/Tagalog → gTTS ใช้ 'tl'
+    "fil": "tl",
+    "fil-ph": "tl",
+    "tl-ph": "tl",
 }
 
 def normalize_gtts_lang(code: str) -> tuple[str, str]:
@@ -62,16 +70,23 @@ def normalize_gtts_lang(code: str) -> tuple[str, str]:
     ทำให้โค้ดเข้ากับ gTTS ได้
     คืน (gtts_key, display_code)
     - display_code ใช้สำหรับ log ให้สวย
+    - รักษา 'zh-CN' / 'zh-TW' ไม่ให้ถูกลดรูป
+    - รองรับ 'fil'/'fil-PH'/'tl-PH' → 'tl'
     """
     if not code:
         return "en", "en"
-    key = code.strip()
-    key_lower = key.lower()
-    key = _GTTs_NORMALIZE.get(key_lower, key_lower)
-    # บางกรณี gTTS ไม่มีตัวเลือกประเทศ → ลดรูปเหลือ 2 ตัวอักษร
-    if "-" in key and key not in ("zh-CN", "zh-TW"):
-        key = key.split("-")[0]
-    return key, key
+    key = code.strip().replace("_", "-")
+    low = key.lower()
+    mapped = _GTTs_NORMALIZE.get(low, low)
+
+    # รักษาโค้ดจีนสองแบบไว้
+    if mapped in ("zh-CN", "zh-TW"):
+        return mapped, mapped
+
+    # gTTS ไม่แยกประเทศส่วนใหญ่ → ลดรูปเหลือภาษาหลัก
+    if "-" in mapped:
+        mapped = mapped.split("-")[0]
+    return mapped, mapped
 
 
 # ---------- Per-part shaping ----------
@@ -85,7 +100,7 @@ def normalize_parts_shape(parts: List[Tuple[str, str]]) -> List[Tuple[str, str]]
         if (
             (not _LANG_PATTERN.fullmatch(b or "")) and
             _LANG_PATTERN.fullmatch((a or "").strip()) and
-            (b or "").strip().lower() != "auto"         # << เพิ่ม guard ตรงนี้
+            (b or "").strip().lower() != "auto"
         ):
             t, lg = b, a
 
@@ -134,7 +149,7 @@ def resolve_tts_code(text: str, hint: str = "auto") -> str:
     """
     เดาภาษา TTS จากข้อความ (หลังตัด emoji แล้ว) + hint ('auto' หรือโค้ดภาษา)
     - ถ้า hint เป็นภาษาถูกต้อง → ใช้เลย
-    - ถ้า 'auto' → เดาตามสคริปต์
+    - ถ้า 'auto' → เดาตามสครिपต์
     """
     h = sanitize_requested_lang(hint)
     if h != "auto":
@@ -156,7 +171,7 @@ def resolve_tts_code(text: str, hint: str = "auto") -> str:
 def _guess_latin_language_by_words(t: str) -> str | None:
     """
     heuristic ง่าย ๆ สำหรับตัวอักษรละติน:
-    - ถ้าพบคำบางคำ → เดา de/fr/es/it/pt
+    - ถ้าพบคำบางคำ → เดา de/fr/es/it/pt/fil
     """
     s = t.lower()
     # เยอรมัน
@@ -165,13 +180,18 @@ def _guess_latin_language_by_words(t: str) -> str | None:
     # ฝรั่งเศส
     if re.search(r"\b(et|merci|non|oui|je|vous|avec|être)\b", s):
         return "fr"
-    # สเปน/โปรตุเกส/อิตาลี (อย่างคร่าว ๆ)
+    # สเปน
     if re.search(r"\b(gracias|hola|buenos|no|sí|por|favor)\b", s):
         return "es"
+    # โปรตุเกส
     if re.search(r"\b(obrigado|olá|não|sim|por|favor)\b", s):
         return "pt"
+    # อิตาลี
     if re.search(r"\b(grazie|ciao|non|si|per|favore)\b", s):
         return "it"
+    # ฟิลิปิโน/ตากาล็อก (คำบ่อยมาก)
+    if re.search(r"\b(ang|ng|mga|sa|ako|ikaw|siya|kami|kayo|sila|hindi|oo|opo|po|salamat|maganda|mahal|kita|bakit|saan|paano|ito|iyan|iyon|wala|meron)\b", s):
+        return "fil"
     return None
 
 def resolve_parts_for_tts(
