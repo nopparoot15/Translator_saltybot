@@ -16,6 +16,11 @@ _STT_CODE_MAP = {
     "ko": "ko-KR",
     "ru": "ru-RU",
     "vi": "vi-VN",
+    "fil": "fil-PH",
+    "fil-PH": "fil-PH",
+    "tl": "fil-PH",
+    "tl-PH": "fil-PH",
+
 }
 
 def _to_stt_code(ui_code: str) -> str:
