@@ -140,6 +140,10 @@ def _build_config(
     # หมายเหตุ: sampleRateHertz ต้อง "ตรงกับไฟล์จริง" เท่านั้น ถ้าไม่ชัวร์อย่าใส่
     return cfg
 
+def _resolve_bucket(name: Optional[str]) -> Optional[str]:
+    """คืนชื่อบัคเก็ต: ใช้ parameter ก่อน, ถ้าไม่มีลอง ENV"""
+    return name or os.getenv("GCS_BUCKET_NAME") or os.getenv("GOOGLE_CLOUD_STORAGE_BUCKET")
+
 # ---------- Public APIs ----------
 async def stt_transcribe_bytes(
     audio_bytes: bytes,
@@ -167,16 +171,18 @@ async def stt_transcribe_bytes(
     """
     ถอดเสียงแบบ synchronous ผ่าน REST API
     แนะนำใช้กับไฟล์สั้น หรือขนาดไม่ใหญ่มาก (≤ ~1 นาที หรือ ≤ ~8-9MB)
-    Return: (text, raw_json_response). ถ้า sync ใช้ไม่ได้และกำหนด fallback_async_bucket_name,
-            ฟังก์ชันจะเรียก long-running ให้เองแล้วคืนผลลัพธ์ทันที
+    Return: (text, raw_json_response). ถ้า sync ใช้ไม่ได้:
+      - จะลองอ่านชื่อบัคเก็ตจาก fallback_async_bucket_name หรือ ENV แล้ว fallback ไป long-running อัตโนมัติ
     """
     key = api_key or os.getenv("GOOGLE_API_KEY", "")
     if not key:
         return "❌ Missing GOOGLE_API_KEY", {}
 
+    bucket = _resolve_bucket(fallback_async_bucket_name)
+
     # ⛔ sync เหมาะกับไฟล์ไม่เกิน ~9MB (base64 แล้วจะพองอีก)
     if len(audio_bytes or b"") > 9_000_000:
-        if fallback_async_bucket_name:
+        if bucket:
             # ส่งต่อไป long-running
             mime = _guess_mime_by_ext(filename, content_type)
             ext = _guess_ext(filename, mime)
@@ -185,12 +191,12 @@ async def stt_transcribe_bytes(
                 audio_bytes,
                 file_ext=ext,
                 content_type=mime,
-                bucket_name=fallback_async_bucket_name,
+                bucket_name=bucket,
                 lang_hint=language_code,
                 alternative_language_codes=alternative_language_codes,
             )
             return text, raw
-        return "❌ Audio too large for synchronous STT (use long-running)", {"hint": "use stt_google_async.transcribe_long_audio_bytes"}
+        return "❌ Audio too large for synchronous STT (use long-running)", {"hint": "set GCS_BUCKET_NAME env or pass fallback_async_bucket_name"}
 
     mime = _guess_mime_by_ext(filename, content_type)
     encoding = _mime_to_encoding(mime, filename)
@@ -228,19 +234,15 @@ async def stt_transcribe_bytes(
         async with httpx.AsyncClient(timeout=timeout) as client:
             resp = await client.post(url, json=payload, headers={"Content-Type": "application/json; charset=utf-8"})
         if resp.status_code != 200:
-            # ถ้าเป็นเคสยาวเกิน ให้ fallback ไป long-running อัตโนมัติ
-            body = resp.text
-            if (
-                fallback_async_bucket_name
-                and resp.status_code == 400
-                and "Sync input too long" in body
-            ):
+            # ถ้าเป็นเคสยาวเกิน ให้ fallback ไป long-running อัตโนมัติ (ใช้ ENV ถ้าไม่ได้ส่งพารามิเตอร์)
+            body = resp.text or ""
+            if bucket and resp.status_code == 400 and "Sync input too long" in body:
                 ext = _guess_ext(filename, mime)
                 text, raw = await _stt_longrun(
                     audio_bytes,
                     file_ext=ext,
                     content_type=mime,
-                    bucket_name=fallback_async_bucket_name,
+                    bucket_name=bucket,
                     lang_hint=language_code,
                     alternative_language_codes=alternative_language_codes,
                 )
@@ -279,7 +281,7 @@ async def stt_transcribe_file(
     alternative_language_codes: Optional[List[str]] = None,
     sample_rate_hz: Optional[int] = None,            # ⭐ รองรับ parameter เดียวกัน
     timeout_s: float = 120.0,
-    fallback_async_bucket_name: Optional[str] = None, # ⭐ auto fallback
+    fallback_async_bucket_name: Optional[str] = None, # ⭐ auto fallback (จะอ่าน ENV ถ้าไม่ได้ส่ง)
 ) -> Tuple[str, Dict[str, Any]]:
     """Wrapper อ่านไฟล์จากดิสก์แล้วเรียก stt_transcribe_bytes"""
     try:
@@ -291,11 +293,13 @@ async def stt_transcribe_file(
     filename = os.path.basename(path)
     content_type = _guess_mime_by_ext(filename, None)
 
-    # ถ้าเป็น Opus และ caller ไม่ส่ง sample_rate_hz มา → ตั้ง 48000
     if sample_rate_hz is None:
         enc = _mime_to_encoding(content_type, filename)
         if enc in ("OGG_OPUS", "WEBM_OPUS"):
             sample_rate_hz = 48000
+
+    # อ่านบัคเก็ตจาก param หรือ ENV
+    bucket = _resolve_bucket(fallback_async_bucket_name)
 
     return await stt_transcribe_bytes(
         audio_bytes,
@@ -314,5 +318,5 @@ async def stt_transcribe_file(
         alternative_language_codes=alternative_language_codes,
         sample_rate_hz=sample_rate_hz,
         timeout_s=timeout_s,
-        fallback_async_bucket_name=fallback_async_bucket_name,  # 👈 ส่งต่อ
+        fallback_async_bucket_name=bucket,  # 👈 ส่งต่อ (ถ้า None จะอ่านจาก ENV ในตัวฟังก์ชัน)
     )
