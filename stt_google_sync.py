@@ -144,6 +144,16 @@ def _resolve_bucket(name: Optional[str]) -> Optional[str]:
     """คืนชื่อบัคเก็ต: ใช้ parameter ก่อน, ถ้าไม่มีลอง ENV"""
     return name or os.getenv("GCS_BUCKET_NAME") or os.getenv("GOOGLE_CLOUD_STORAGE_BUCKET")
 
+def _should_force_longrun(encoding: str, size_bytes: int) -> bool:
+    """
+    ถ้าเป็นไฟล์บีบอัด (MP3/OGG/WEBM/M4A) และขนาดเกิน ~1.8MB
+    มีโอกาสสูงว่าเกิน 1 นาที → บังคับใช้ long-running เลย
+    """
+    if encoding in ("MP3", "OGG_OPUS", "WEBM_OPUS", "ENCODING_UNSPECIFIED"):
+        return size_bytes > 1_800_000
+    # WAV/FLAC ไม่บีบอัด ใช้เกณฑ์เดิม
+    return size_bytes > 9_000_000
+
 # ---------- Public APIs ----------
 async def stt_transcribe_bytes(
     audio_bytes: bytes,
@@ -187,13 +197,17 @@ async def stt_transcribe_bytes(
             mime = _guess_mime_by_ext(filename, content_type)
             ext = _guess_ext(filename, mime)
             language_code = _norm_lang(lang_hint) or "th-TH"
+            # เติม en-US ให้อัตโนมัติกรณีไทยปนอังกฤษ
+            alt_codes = alternative_language_codes
+            if language_code.startswith("th") and (not alt_codes or "en-US" not in alt_codes):
+                alt_codes = ["en-US"] + (alt_codes or [])
             text, raw = await _stt_longrun(
                 audio_bytes,
                 file_ext=ext,
                 content_type=mime,
                 bucket_name=bucket,
                 lang_hint=language_code,
-                alternative_language_codes=alternative_language_codes,
+                alternative_language_codes=alt_codes,
             )
             return text, raw
         return "❌ Audio too large for synchronous STT (use long-running)", {"hint": "set GCS_BUCKET_NAME env or pass fallback_async_bucket_name"}
@@ -208,7 +222,23 @@ async def stt_transcribe_bytes(
     # ภาษา: ถ้า caller ไม่ส่งมา ให้ default เป็นไทย และ normalize ให้ Google ชอบ
     language_code = _norm_lang(lang_hint) or "th-TH"
 
-    # Base64 audio
+    # ⭐ บังคับไป long-running เลยถ้าไฟล์บีบอัดและน่าจะยาวเกิน 1 นาที
+    if bucket and _should_force_longrun(encoding, len(audio_bytes or b"")):
+        ext = _guess_ext(filename, mime)
+        alt_codes = alternative_language_codes
+        if language_code.startswith("th") and (not alt_codes or "en-US" not in alt_codes):
+            alt_codes = ["en-US"] + (alt_codes or [])
+        text, raw = await _stt_longrun(
+            audio_bytes,
+            file_ext=ext,
+            content_type=mime,
+            bucket_name=bucket,
+            lang_hint=language_code,
+            alternative_language_codes=alt_codes,
+        )
+        return text, raw
+
+    # Base64 audio (ไปทาง sync)
     b64 = base64.b64encode(audio_bytes).decode("utf-8")
 
     config = _build_config(
@@ -238,13 +268,16 @@ async def stt_transcribe_bytes(
             body = resp.text or ""
             if bucket and resp.status_code == 400 and "Sync input too long" in body:
                 ext = _guess_ext(filename, mime)
+                alt_codes = alternative_language_codes
+                if language_code.startswith("th") and (not alt_codes or "en-US" not in alt_codes):
+                    alt_codes = ["en-US"] + (alt_codes or [])
                 text, raw = await _stt_longrun(
                     audio_bytes,
                     file_ext=ext,
                     content_type=mime,
                     bucket_name=bucket,
                     lang_hint=language_code,
-                    alternative_language_codes=alternative_language_codes,
+                    alternative_language_codes=alt_codes,
                 )
                 return text, raw
             return f"❌ STT HTTP {resp.status_code}", {"error": body, "config": config}
