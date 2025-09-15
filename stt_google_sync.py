@@ -16,7 +16,7 @@ import os
 from typing import Optional, Tuple, Dict, Any, List
 import httpx
 
-# ✅ เพิ่ม: ใช้ long-running อัตโนมัติเมื่อ sync ใช้ไม่ได้
+# ✅ ใช้ long-running อัตโนมัติเมื่อ sync ใช้ไม่ได้
 from stt_google_async import transcribe_long_audio_bytes as _stt_longrun
 
 # ---------- Helpers ----------
@@ -159,9 +159,9 @@ async def stt_transcribe_bytes(
     model: Optional[str] = None,
     use_enhanced: Optional[bool] = None,
     alternative_language_codes: Optional[List[str]] = None,
-    sample_rate_hz: Optional[int] = None,            # ⭐ เพิ่ม: กำหนด sample rate เมื่อจำเป็น (Opus)
+    sample_rate_hz: Optional[int] = None,            # ⭐ กำหนด sample rate เมื่อจำเป็น (Opus)
     timeout_s: float = 120.0,
-    # ⭐ เพิ่ม: ให้ระบุ bucket เพื่อ fallback อัตโนมัติไป long-running เมื่อ sync ใช้ไม่ได้
+    # ⭐ ให้ระบุ bucket เพื่อ fallback อัตโนมัติไป long-running เมื่อ sync ใช้ไม่ได้
     fallback_async_bucket_name: Optional[str] = None,
 ) -> Tuple[str, Dict[str, Any]]:
     """
@@ -188,7 +188,6 @@ async def stt_transcribe_bytes(
                 bucket_name=fallback_async_bucket_name,
                 lang_hint=language_code,
                 alternative_language_codes=alternative_language_codes,
-                # ใช้ค่า default อื่นๆ เหมือนเดิม
             )
             return text, raw
         return "❌ Audio too large for synchronous STT (use long-running)", {"hint": "use stt_google_async.transcribe_long_audio_bytes"}
@@ -280,8 +279,9 @@ async def stt_transcribe_file(
     alternative_language_codes: Optional[List[str]] = None,
     sample_rate_hz: Optional[int] = None,            # ⭐ รองรับ parameter เดียวกัน
     timeout_s: float = 120.0,
-    fallback_async_bucket_name: Optional[str] = None, # ⭐ เพิ่ม: auto fallback
-) -> Tuple[str, Dict[str, Any]]:  # Wrapper อ่านไฟล์จากดิสก์แล้วเรียก stt_transcribe_bytes
+    fallback_async_bucket_name: Optional[str] = None, # ⭐ auto fallback
+) -> Tuple[str, Dict[str, Any]]:
+    """Wrapper อ่านไฟล์จากดิสก์แล้วเรียก stt_transcribe_bytes"""
     try:
         with open(path, "rb") as f:
             audio_bytes = f.read()
@@ -314,5 +314,5 @@ async def stt_transcribe_file(
         alternative_language_codes=alternative_language_codes,
         sample_rate_hz=sample_rate_hz,
         timeout_s=timeout_s,
-        fallback_async_bucket_name=fallback_async_bucket_name,  # ⭐ ส่งต่อ
+        fallback_async_bucket_name=fallback_async_bucket_name,  # 👈 ส่งต่อ
     )
