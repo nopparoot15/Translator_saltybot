@@ -1,104 +1,130 @@
 from __future__ import annotations
 import re
 from dataclasses import dataclass
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Tuple
 
 Lang = str
 
-# --- 1) Lexicon คำสแลง/คำด่าแบบหลายภาษา (มีระดับความแรง) ---
-# หมายเหตุ: ไม่ต้องครบจักรวาล แต่พอให้ “ฟีลธรรมชาติ” ขึ้นมาก
-# สามารถเติม/แก้คำตามคอมมูนิตี้ของคุณได้เรื่อย ๆ
-SLANG_LEX: Dict[Lang, Dict[str, Dict[str, str]]] = {
-    # Thai
+# =========================================================
+# Render dictionary per language (เลือกคำแทนแท็กให้ “เป็นธรรมชาติ”)
+# ถ้าภาษาไหนไม่มี จะ fallback เป็น EN อัตโนมัติ
+# =========================================================
+TAG_RENDER: Dict[Lang, Dict[str, List[str]]] = {
     "th": {
-        "เชี่ย":   {"cat": "insult", "sev": "mid", "neutral": "ซวยละ"},
-        "เหี้ย":    {"cat": "insult", "sev": "high", "neutral": "แย่จัด"},
-        "ไอเวร":   {"cat": "insult", "sev": "mid", "neutral": "ไอนี่"},
-        "ไอบ้า":   {"cat": "insult", "sev": "low", "neutral": "บ้าไปแล้ว"},
-        "แม่ง":     {"cat": "intensity", "sev": "low", "neutral": "โคตร"},
-        "กู":       {"cat": "pronoun_1p", "sev": "casual", "neutral": "ฉัน"},
-        "มึง":      {"cat": "pronoun_2p", "sev": "casual", "neutral": "นาย"},
-        "ว่ะ":     {"cat": "ending", "sev": "casual", "neutral": "นะ"},
-        "วะ":      {"cat": "ending", "sev": "casual", "neutral": "นะ"},
+        "BRO": ["มึง", "แก"], "HUH": ["วะ", "ว่ะ", "นะ"], "LOL": ["555", "ฮ่าๆ"],
+        "KINDOF": ["เหมือนจะ", "ค่อนข้าง"], "SARC": ["(ประชด)"],
     },
-    # English
     "en": {
-        "shit":         {"cat": "insult", "sev": "mid", "neutral": "dang"},
-        "fuck":         {"cat": "insult", "sev": "high", "neutral": "freaking"},
-        "asshole":      {"cat": "insult", "sev": "high", "neutral": "jerk"},
-        "idiot":        {"cat": "insult", "sev": "low", "neutral": "dummy"},
-        "moron":        {"cat": "insult", "sev": "mid", "neutral": "dumbass"},
-        "bro":          {"cat": "pronoun_2p", "sev": "casual", "neutral": "you"},
-        "dude":         {"cat": "pronoun_2p", "sev": "casual", "neutral": "you"},
-        "man":          {"cat": "discourse", "sev": "casual", "neutral": ""},
-        "huh":          {"cat": "ending", "sev": "casual", "neutral": ""},
-        "kinda":        {"cat": "hedge", "sev": "soft", "neutral": "somewhat"},
-        "low-key":      {"cat": "hedge", "sev": "soft", "neutral": "slightly"},
-        "lol":          {"cat": "laugh", "sev": "casual", "neutral": "haha"},
+        "BRO": ["bro", "dude", "man"], "HUH": ["huh", "right"], "LOL": ["lol", "haha", "lmao"],
+        "KINDOF": ["kinda", "sort of", "low-key"], "SARC": ["(sarcasm)"],
     },
-    # Japanese
     "ja": {
-        "バカ": {"cat":"insult","sev":"low","neutral":"バカ"},
-        "アホ": {"cat":"insult","sev":"low","neutral":"アホ"},
-        "くそ": {"cat":"insult","sev":"mid","neutral":"やば"},
-        "お前": {"cat":"pronoun_2p","sev":"casual","neutral":"君"},
-        "だよな": {"cat":"ending","sev":"casual","neutral":"よね"},
-        "な？":  {"cat":"ending","sev":"casual","neutral":"よね？"},
+        "BRO": ["お前", "君"], "HUH": ["な", "ね", "よな"], "LOL": ["笑", "草"],
+        "KINDOF": ["なんか", "ちょっと"], "SARC": ["（皮肉）"],
     },
-    # Spanish
-    "es": {
-        "idiota": {"cat":"insult","sev":"low","neutral":"tonto"},
-        "boludo": {"cat":"insult","sev":"mid","neutral":"tarado"},
-        "wey":    {"cat":"pronoun_2p","sev":"casual","neutral":"tío"},
-        "¿no?":   {"cat":"ending","sev":"casual","neutral":"¿no?"},
-        "jaja":   {"cat":"laugh","sev":"casual","neutral":"jaja"},
+    "zh": {
+        "BRO": ["哥们", "兄弟", "老铁"], "HUH": ["吧", "嘛"], "LOL": ["哈哈", "笑死"],
+        "KINDOF": ["有点", "有那么点"], "SARC": ["（讽刺）"],
     },
-    # Filipino
+    "ko": {
+        "BRO": ["야", "브로"], "HUH": ["냐", "지"], "LOL": ["ㅋㅋ", "ㅎㅎ"],
+        "KINDOF": ["약간", "좀"], "SARC": ["(비꼼)"],
+    },
+    "vi": {
+        "BRO": ["mày", "ông"], "HUH": ["hả", "nhỉ"], "LOL": ["haha", "kkk"],
+        "KINDOF": ["kiểu như", "hơi bị"], "SARC": ["(mỉa mai)"],
+    },
     "fil": {
-        "tanga": {"cat":"insult","sev":"mid","neutral":"bobo"},
-        "bobo":  {"cat":"insult","sev":"low","neutral":"tanga"},
-        "pre":   {"cat":"pronoun_2p","sev":"casual","neutral":"ikaw"},
-        "tol":   {"cat":"pronoun_2p","sev":"casual","neutral":"ikaw"},
-        "no?":   {"cat":"ending","sev":"casual","neutral":"no?"},
+        "BRO": ["pre", "pare", "tol"], "HUH": ["no?", "ha?"], "LOL": ["haha", "lmao"],
+        "KINDOF": ["parang", "medyo"], "SARC": ["(sarkasmo)"],
     },
-    # เพิ่ม zh/ko/id/ru/... ตามต้องการในภายหลังได้
+    "id": {
+        "BRO": ["bro", "bang"], "HUH": ["kan?", "ya?"], "LOL": ["wkwk", "haha"],
+        "KINDOF": ["kayak", "agak"], "SARC": ["(nyinyir)"],
+    },
+    "fr": { "BRO": ["mec", "frère"], "HUH": ["hein", "non?"], "LOL": ["mdr", "haha"], "KINDOF": ["un peu", "genre"], "SARC": ["(sarcasme)"] },
+    "de": { "BRO": ["Alter", "Digga"], "HUH": ["oder?", "ne?"], "LOL": ["lol", "haha"], "KINDOF": ["irgendwie", "ein bisschen"], "SARC": ["(Sarkasmus)"] },
+    "es": { "BRO": ["wey", "tío"], "HUH": ["¿no?", "¿eh?"], "LOL": ["jaja", "xd"], "KINDOF": ["como que", "medio"], "SARC": ["(sarcasmo)"] },
+    "it": { "BRO": ["bro", "amico"], "HUH": ["eh?", "no?"], "LOL": ["ahaha", "lol"], "KINDOF": ["tipo", "un po'"], "SARC": ["(sarcasmo)"] },
+    "pt": { "BRO": ["mano", "cara"], "HUH": ["né?", "hein?"], "LOL": ["kkk", "haha"], "KINDOF": ["meio que", "um pouco"], "SARC": ["(sarcasmo)"] },
+    "pl": { "BRO": ["stary", "ziomek"], "HUH": ["no nie?", "co?"], "LOL": ["xD", "haha"], "KINDOF": ["trochę", "tak jakby"], "SARC": ["(sarkazm)"] },
+    "uk": { "BRO": ["друже", "чувак"], "HUH": ["га?", "так?"], "LOL": ["лол", "хаха"], "KINDOF": ["ніби", "трохи"], "SARC": ["(сарказм)"] },
+    "ru": { "BRO": ["чувак", "бро"], "HUH": ["а?", "да?"], "LOL": ["лол", "ахаха"], "KINDOF": ["типа", "слегка"], "SARC": ["(сарказм)"] },
+    "hi": { "BRO": ["यार", "भाई"], "HUH": ["ना", "क्या"], "LOL": ["हाहा", "lol"], "KINDOF": ["थोड़ा", "किस्म का"], "SARC": ["(तंज)"] },
+    "km": { "BRO": ["បង"], "HUH": ["ដែរ?", "ម៉េច?"], "LOL": ["ហា​ហា"], "KINDOF": ["ប្រហែល", "តិចតួច"], "SARC": ["(សើចចំ)"] },
+    "my": { "BRO": ["ရေ"], "HUH": ["လား", "နော်"], "LOL": ["ဟားဟား"], "KINDOF": ["အနည်းငယ်"], "SARC": ["(သံယောဇဥ်)"] },
+    "ar": { "BRO": ["يا زلمة", "يا صاح"], "HUH": ["ها؟", "مش كده؟"], "LOL": ["هههه", "لول"], "KINDOF": ["شوية", "كده"], "SARC": ["(سخرية)"] },
 }
+# alias
+TAG_RENDER["fil-PH"] = TAG_RENDER["fil"]
+TAG_RENDER["tl"] = TAG_RENDER["fil"]
 
-# ให้ alias ตกไปภาษาพื้นฐาน
-for alias, base in [("fil-PH","fil"), ("tl","fil")]:
-    if base in SLANG_LEX and alias not in SLANG_LEX:
-        SLANG_LEX[alias] = SLANG_LEX[base]
-
-# --- 2) Hints & Config ---
+# =========================================================
+# 1) PRE-ANNOTATE — ใส่แท็กจากข้อความต้นฉบับ
+# =========================================================
 @dataclass
 class ToneHints:
     has_slang: bool = False
     sarcasm: bool = False
-    intensity: str = "normal"  # "soft"|"normal"|"hard"
-    style: str = "preserve"    # "preserve"|"neutralize"
+    intensity: str = "normal"  # soft|normal|hard
+    style: str = "preserve"    # preserve|neutralize
 
-# --- 3) Utility: ตรวจสแลง/คำด่าเพื่อชี้นำ LLM ---
-def detect_slang_intent(text: str, lang: Lang) -> ToneHints:
-    t = text.strip()
+_TAGS = {
+    "BRO": r"(มึง|แก|เอ็ง|\b(bro|dude|man)\b|お前|哥们|兄弟|老铁|야|mày|pre|tol|bang|wey|mano|stary|чувак|يا زلمة)",
+    "LOL": r"(555+|ฮ่า+|ขำ|\blol\b|\blmao\b|haha|草|笑|ㅋㅋ+|ㅎㅎ+|jaja|xd|\bkkk\b|mdr|xD|лол|ахаха|هههه)",
+    "KINDOF": r"(เหมือนจะ|ค่อนข้าง|นิดหน่อย)|\b(kinda|sort of|low[- ]?key)\b|なんか|ちょっと|有点|약간|parang|medyo|kayak|agak|un poco|irgendwie|medio|tipo|meio que|trochę|ніби|типа|شوية",
+    # ตัวลงท้าย/หยอกล้อ → ถ้าอยู่ท้ายประโยคจะเติม <HUH>
+    "HUH_END": r"(วะ|ว่ะ|นะ|ปะ|หรือไง)\s*$|(?:\b(huh|right|eh)\b|¿no\?|né\?)\s*$|[なね]？?$|吧?$|냐\?$",
+    "SARC": r"(ประชด|แดกดัน)|\(sarcasm\)|皮肉|讽刺|비꼼|sarkasmo|Sarkasmus|sarcasmo|сарказм|سخرية",
+}
+
+def _pick(lang: Lang, key: str) -> str:
+    cand = TAG_RENDER.get(lang, TAG_RENDER["en"]).get(key) or TAG_RENDER["en"].get(key, [])
+    return cand[0] if cand else ""
+
+def pre_annotate(text: str, src_lang: Lang) -> Tuple[str, ToneHints]:
+    """
+    ตรวจคำสแลงแบบกว้าง ๆ แล้วแปะแท็ก <BRO> <LOL> <KINDOF> และ <HUH> (ถ้าลงท้าย)
+    """
+    t = (text or "").strip()
     hints = ToneHints()
-    lex = SLANG_LEX.get(lang, {})
-    hit = 0
-    for w in lex.keys():
-        if re.search(rf"\b{re.escape(w)}\b", t, flags=re.I):
-            hit += 1
-            cat = lex[w]["cat"]
-            if cat in ("insult","pronoun_2p","ending","hedge","laugh"):
-                hints.has_slang = True
-            if cat == "insult" and lex[w]["sev"] in ("mid","high"):
-                hints.intensity = "hard"
-    # heuristic เพิ่มเติม
-    if re.search(r"(เหมือนจะ|ค่อนข้าง|นิดหน่อย|kinda|low[- ]?key|なんか|ちょっと|有点)", t, flags=re.I):
-        hints.has_slang = True
-    if re.search(r"(ประชด|แดกดัน|\(sarcasm\)|皮肉|讽刺|비꼼|sarkasmo|Sarkasmus|sarcasmo|сарказм|سخرية)", t, flags=re.I):
-        hints.sarcasm = True
-    return hints
 
-# --- 4) Prompt สั่ง LLM ให้ทั้ง “คงแท็ก” และ “พูดเป็นธรรมชาติ” ---
+    if re.search(_TAGS["BRO"], t, flags=re.I):
+        t = f"<BRO>{t}"
+        hints.has_slang = True
+
+    if re.search(_TAGS["LOL"], t, flags=re.I):
+        t = f"<LOL>{t}"
+        hints.has_slang = True
+
+    if re.search(_TAGS["KINDOF"], t, flags=re.I):
+        t = f"<KINDOF>{t}"
+        hints.has_slang = True
+
+    if re.search(_TAGS["HUH_END"], t, flags=re.I):
+        t = f"{t} <HUH>"
+        hints.has_slang = True
+
+    if re.search(_TAGS["SARC"], t, flags=re.I):
+        t = f"<SARC>{t}"
+        hints.sarcasm = True
+
+    return t, hints
+
+# =========================================================
+# 2) PROMPTS
+# =========================================================
+def build_tone_prompt(src: Lang, tgt: Lang) -> str:
+    return (
+        "You are a tone-preserving translator.\n"
+        "RULES:\n"
+        "1) Preserve slang/register, teasing/sarcasm if present.\n"
+        "2) NEVER translate or remove tags: <BRO>, <HUH>, <LOL>, <KINDOF>, <SARC>.\n"
+        "3) Translate the rest naturally into the target language.\n"
+        "4) Return ONLY the translated text with the tags kept.\n"
+        f"Source={src} Target={tgt}\n"
+    )
+
 def build_natural_prompt(src: Lang, tgt: Lang, hints: ToneHints) -> str:
     style_line = (
         "If style='neutralize', slightly soften profanity but keep the teasing intent.\n"
@@ -106,47 +132,61 @@ def build_natural_prompt(src: Lang, tgt: Lang, hints: ToneHints) -> str:
         "Keep original roughness if present; do NOT sanitize profanity.\n"
     )
     intensity_line = {
-        "soft":   "Hedge more (kinda/sort of / ちょっと / 有点). ",
+        "soft": "Hedge more if casual. ",
         "normal": "",
-        "hard":   "Allow strong slang/insults in target if common/natural. ",
+        "hard": "Allow strong slang/insults if natural in the target. ",
     }[hints.intensity]
-
-    # few-shot สั้น ๆ เป็นแนวทางธรรมชาติ (ระวังไม่ให้ยาวเกิน)
-    examples = (
-        "Examples:\n"
-        "- TH casual → EN: '<BRO>เหมือนมึงหล่ออะ <HUH>' → 'bro, it’s like you’re handsome, huh'\n"
-        "- EN insult → TH: 'you idiot, seriously' → 'ไอ้โง่ จริงจังดิ'\n"
-        "- ES tease → EN: 'Wey, como que te crees famoso ¿no?' → 'bro, kinda acting like you’re famous, huh?'\n"
-        "- JA casual → TH: 'お前 調子乗ってんな' → 'มึง กำลังหลงตัวเองนะ'\n"
-    )
 
     return (
         "You are a **tone-preserving, natural translator**.\n"
         "Goals:\n"
         "1) Preserve register (casual/rude/polite), teasing/sarcasm, slang strength.\n"
-        "2) Make the target sentence SOUND NATURAL for a native speaker of the target language.\n"
-        "3) NEVER translate or remove tags like <BRO>, <HUH>, <LOL>, <KINDOF>, <SARC>.\n"
-        "4) Choose idiomatic equivalents for slang/insults that are commonly used in the target language.\n"
+        "2) Make the target sentence sound NATURAL for native speakers.\n"
+        "3) NEVER translate/remove angle-bracket tags (<BRO>, <HUH>, <LOL>, <KINDOF>, <SARC>).\n"
+        "4) Choose idiomatic equivalents for slang/insults common in the target language.\n"
         f"{style_line}{intensity_line}"
         f"Source={src} Target={tgt}\n"
-        f"{examples}"
-        "Return ONLY the translated text with tags kept in place."
+        "Return ONLY the translated text with tags kept."
     )
 
-# --- 5) Pre-annotate (คุณมีอยู่แล้ว) + ปรับเล็กน้อยให้เรียก detect_slang_intent ---
-def pre_annotate_natural(text: str, src_lang: Lang, style: str = "preserve") -> Tuple[str, ToneHints]:
-    # ใช้ของเดิม: ใส่ <BRO>/<HUH>/... (ถ้ามี)
-    annotated, base_hints = pre_annotate(text, src_lang)  # <-- ฟังก์ชันเดิมในไฟล์คุณ
-    # เติม hints จาก lexicon
-    lex_hints = detect_slang_intent(text, src_lang)
-    base_hints.has_slang = base_hints.has_slang or lex_hints.has_slang
-    base_hints.sarcasm  = base_hints.sarcasm  or lex_hints.sarcasm
-    if lex_hints.intensity == "hard":
-        base_hints.intensity = "hard"
-    base_hints.style = style
-    return annotated, base_hints
+# =========================================================
+# 3) POST-RENDER — แทนแท็กเป็นสำนวนภาษาปลายทาง
+# =========================================================
+def post_render(text: str, tgt_lang: Lang) -> str:
+    out = (text or "").strip()
+    prof = TAG_RENDER.get(tgt_lang, TAG_RENDER["en"])
 
-# --- 6) ฟังก์ชัน high-level ใช้แทน translate_with_tone ของเดิม ---
+    def rep(tag: str) -> str:
+        lst = prof.get(tag) or TAG_RENDER["en"].get(tag, [])
+        return lst[0] if lst else ""
+
+    if "<BRO>" in out:
+        out = out.replace("<BRO>", (rep("BRO") + " ") if rep("BRO") else "")
+    if "<LOL>" in out:
+        out = out.replace("<LOL>", (" " + rep("LOL")) if rep("LOL") else "")
+    if "<KINDOF>" in out:
+        out = out.replace("<KINDOF>", (" " + rep("KINDOF")) if rep("KINDOF") else "")
+    if "<HUH>" in out:
+        out = out.replace("<HUH>", (", " + rep("HUH")) if rep("HUH") else "")
+    if "<SARC>" in out:
+        out = out.replace("<SARC>", (" " + rep("SARC")) if rep("SARC") else "")
+
+    out = re.sub(r"\s{2,}", " ", out)
+    out = re.sub(r"\s+,", ",", out)
+    return out.strip()
+
+# =========================================================
+# 4) SMART TRANSLATE — Entry point ที่ translation_service เรียกใช้
+# =========================================================
+@dataclass
+class _Hints(ToneHints):
+    pass
+
+def _pre_annotate_natural(text: str, src_lang: Lang, style: str) -> tuple[str, _Hints]:
+    annotated, h = pre_annotate(text, src_lang)
+    h.style = style
+    return annotated, _Hints(**h.__dict__)
+
 async def smart_translate(
     text: str,
     src: Lang,
@@ -154,41 +194,20 @@ async def smart_translate(
     engine: str,
     *,
     style: str = "preserve",      # "preserve" | "neutralize"
-    natural_pass: bool = True,    # ให้ LLM ช่วย “ทำให้เป็นธรรมชาติ” ระหว่างแปล
-    llm_translate_callable=None,  # ฟังก์ชันเรียก LLM ของโปรเจกต์คุณ
+    natural_pass: bool = True,
+    llm_translate_callable=None,  # async def (text, src, tgt, engine, system_prompt=...)
 ) -> str:
     """
-    ใช้แทนที่เดิม: natural, slang-aware, tone-preserving
+    ใช้ร่วมกับ translation_service.llm_translate_wrapper
+    คืนค่าเป็น "ข้อความล้วน" (ไม่มี <T>...</T>)
     """
-    assert llm_translate_callable is not None, "Provide llm_translate(text, src, tgt, engine, system_prompt=...)"
+    assert llm_translate_callable is not None, "smart_translate requires llm_translate_callable"
 
-    # 1) annotate + hints
-    annotated, hints = pre_annotate_natural(text, src, style=style)
+    annotated, hints = _pre_annotate_natural(text or "", src, style=style)
+    system_prompt = build_natural_prompt(src, tgt, hints) if natural_pass else build_tone_prompt(src, tgt)
 
-    # 2) system prompt
-    system_prompt = build_natural_prompt(src, tgt, hints) if natural_pass \
-                    else build_tone_prompt(src, tgt)  # fallback prompt เดิม
-
-    # 3) แปล (เก็บแท็กไว้)
+    # แปล (ให้ LLM คงแท็กไว้)
     raw = await llm_translate_callable(annotated, src, tgt, engine, system_prompt=system_prompt)
 
-    # 4) post-render แท็ก → สำนวนภาษาปลายทาง
-    out = post_render(raw, tgt)
-
-    # 5) (ออปชัน) ถ้า style='neutralize' ให้ลดความหยาบแรงนิดหนึ่งโดยใช้ lexicon เป้า
-    if style == "neutralize":
-        out = soften_profanity(out, tgt)
-
-    # เกลาครั้งสุดท้าย: ช่องว่าง/วรรคตอน
-    out = re.sub(r"\s{2,}", " ", out).strip()
-    out = re.sub(r"\s+,", ",", out)
-    return out
-
-def soften_profanity(text: str, tgt: Lang) -> str:
-    lex = SLANG_LEX.get(tgt, {})
-    out = text
-    # แทนคำแรงระดับ high → mid/neutral ถ้ามีใน lexicon
-    for w, meta in lex.items():
-        if meta["cat"] == "insult" and meta.get("sev") in ("mid","high"):
-            out = re.sub(rf"\b{re.escape(w)}\b", meta.get("neutral", w), out, flags=re.I)
-    return out
+    # เรนเดอร์แท็กเป็นสำนวนปลายทาง
+    return post_render(raw, tgt)
