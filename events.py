@@ -37,7 +37,7 @@ from stt_select_panel import STTLanguagePanel, _to_stt_code
 
 logger = logging.getLogger(__name__)
 
-# --- STT helpers (auto long-running + alt-langs) ---
+# --- STT helpers (auto long-running + retry alts) ---
 _COMPRESSED_EXTS = {".mp3", ".m4a", ".ogg", ".opus", ".webm", ".mp4"}
 
 def _is_compressed(name: str, content_type: str) -> bool:
@@ -63,8 +63,11 @@ def _ensure_alts_for_code_switch(base_lang_code: str, alt_iso: list[str] | None)
     # ไทยปนอังกฤษบ่อย → เติม en
     if (base_lang_code or "").lower().startswith("th") and "en" not in [a.split("-")[0].lower() for a in alts]:
         alts = ["en"] + alts
-    # จำกัด 3 ตัวตามที่โค้ดรองรับ
     return alts[:3]
+
+_TH_RE = re.compile(r'[\u0E00-\u0E7F]')
+def _looks_thai(s: str) -> bool:
+    return bool(_TH_RE.search(s or ""))
 
 def register_message_handlers(bot):
     @bot.listen("on_message")
@@ -134,8 +137,9 @@ def register_message_handlers(bot):
                 async def _run_stt_with_lang(interaction, base_lang_code: str):
                     """
                     ถอดเสียงตามภาษาที่ผู้ใช้เลือก + โควต้า STT ต่อวันใน Redis
+                    - รอบแรก: ส่ง "ภาษาเดียว" ที่ผู้ใช้เลือก (ไม่มี alt) → กันหลุดไปภาษาอื่น
+                    - ถ้าผลว่าง/ภาษาไม่ตรง → รอบสองค่อยลองรวม alt-langs (เช่น en-US)
                     - เลือก long-running อัตโนมัติสำหรับไฟล์บีบอัด > ~1.8MB
-                    - ใส่ alternativeLanguageCodes ตั้งแต่รอบแรก (ไทย → เติม en)
                     """
                     flag = FLAGS.get(base_lang_code, FLAGS.get(base_lang_code.split("-")[0], "")) or ""
                     progress_msg = None
@@ -197,7 +201,7 @@ def register_message_handlers(bot):
                         audio_bytes, fn, ctype, did_trans = await ensure_stt_compatible(filename, content_type, raw_bytes)
                         filename2, content_type2 = fn, ctype
 
-                        # เดา alts จากบริบท/ประวัติ และเติมสำหรับ code-switch
+                        # เดา alts จากบริบท/ประวัติ (ไว้สำหรับรอบถัดไป)
                         context_bias = detect_lang_hints_from_context(
                             username=str(message.author),
                             channel_name=getattr(message.channel, "name", "") or "",
@@ -233,8 +237,8 @@ def register_message_handlers(bot):
                                 pass
 
                         async def _run_once(alts_iso: list[str] | None):
-                            # แปลง ISO → BCP-47
-                            alts_bcp = [_to_stt_code(c) for c in (alts_iso or [])[:3]]
+                            # แปลง ISO → BCP-47 เฉพาะตอนมี alts
+                            alts_bcp = [_to_stt_code(c) for c in (alts_iso or [])[:3]] if alts_iso else None
                         
                             if use_long:
                                 lr_kwargs = dict(
@@ -243,12 +247,13 @@ def register_message_handlers(bot):
                                     content_type=content_type2 or None,
                                     bucket_name=GCS_BUCKET_NAME,
                                     lang_hint=base_lang_code,
-                                    alternative_language_codes=alts_bcp,   # ใช้ตัวนี้ "ครั้งเดียว"
                                     poll=True,
                                     max_wait_sec=900.0,
                                     audio_channel_count=1,
                                     enable_separate_recognition_per_channel=False,
                                 )
+                                if alts_bcp:
+                                    lr_kwargs["alternative_language_codes"] = alts_bcp
                                 return await transcribe_long_audio_bytes(**lr_kwargs)
                             else:
                                 sync_kwargs = dict(
@@ -257,11 +262,12 @@ def register_message_handlers(bot):
                                     filename=a.filename,
                                     content_type=content_type2,
                                     lang_hint=base_lang_code,
-                                    alternative_language_codes=alts_bcp,   # ใช้ตัวนี้ "ครั้งเดียว"
                                     enable_punctuation=True,
                                     max_alternatives=1,
                                     timeout_s=90.0,
                                 )
+                                if alts_bcp:
+                                    sync_kwargs["alternative_language_codes"] = alts_bcp
                                 if content_type2.startswith("audio/wav") or filename2.endswith(".wav"):
                                     sync_kwargs.update(sample_rate_hz=16000, audio_channel_count=1,
                                                        enable_separate_recognition_per_channel=False)
@@ -272,9 +278,9 @@ def register_message_handlers(bot):
                                                        enable_separate_recognition_per_channel=False)
                                 return await stt_transcribe_bytes(**sync_kwargs)
 
-                        # รอบ 1: ใช้ alt-langs ตั้งแต่แรก (ช่วย code-switch)
+                        # รอบ 1: ภาษาเดียว ไม่มี alt (ล็อกภาษาให้ตรงกับที่เลือก)
                         await _status("กำลังถอดเสียง…")
-                        text, raw = await _run_once(alt_iso_first)
+                        text, raw = await _run_once(None)
 
                         # ถ้า error ฝั่ง API
                         if text.startswith("❌") or (isinstance(raw, dict) and raw.get("error")):
@@ -293,10 +299,16 @@ def register_message_handlers(bot):
                             await stt_refund(user_id, guild_id, reserved_sec, TZ)
                             return
 
-                        # รอบ 2: ยังว่าง → ลองชุด alt จากสถิติเต็ม ๆ
-                        if not (text or "").strip() and (alt_iso or []):
-                            await _status("ยังไม่ได้ข้อความ ลองอีกครั้งด้วยภาษาใกล้เคียง…")
-                            text2, raw2 = await _run_once(alt_iso)
+                        # รอบ 2: ถ้าว่าง หรือภาษาไม่ตรง (เช่นเลือก th แต่ไม่มีอักษรไทย) → ลองใส่ alt
+                        need_retry_with_alts = False
+                        if not (text or "").strip():
+                            need_retry_with_alts = True
+                        elif base_lang_code.lower().startswith("th") and not _looks_thai(text):
+                            need_retry_with_alts = True
+
+                        if need_retry_with_alts:
+                            await _status("ยังไม่ได้ข้อความ/ภาษาไม่ตรง ลองรวมภาษาใกล้เคียง…")
+                            text2, raw2 = await _run_once(alt_iso_first)
                             if (text2 or "").strip():
                                 text, raw = text2, raw2
 
@@ -317,9 +329,9 @@ def register_message_handlers(bot):
                                 use_long = _should_force_longrun(len(reb_bytes), filename2, content_type2)
                                 stt_mode = "google longrunning" if use_long else "google sync"
 
-                                t3, r3 = await _run_once(alt_iso_first)
-                                if not (t3 or "").strip() and (alt_iso or []):
-                                    t4, r4 = await _run_once(alt_iso)
+                                t3, r3 = await _run_once(None)
+                                if not (t3 or "").strip():
+                                    t4, r4 = await _run_once(alt_iso_first)
                                     text, raw = (t4, r4) if (t4 or "").strip() else (t3, r3)
                                 else:
                                     text, raw = t3, r3
