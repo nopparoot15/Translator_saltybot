@@ -269,18 +269,20 @@ async def translate_with_provider(
 
     # 1) โหมดฉลาด: คงโทน/สแลง + ทำให้ธรรมชาติ
     try:
+        logger.info("[translate] try smart_translate provider=%s model=%s src=%r tgt=%s", provider, model, source_code or "auto", target_code)
         smart_out = await smart_translate(
             src_text,
             src=(source_code or "auto"),
             tgt=target_code,
             engine=model,
-            style="preserve",           # หรือ "neutralize" ถ้าต้องการลดคำหยาบ
+            style="preserve",
             natural_pass=True,
             llm_translate_callable=llm_translate_wrapper,
         )
+        logger.info("[translate] smart_translate OK len=%d", len(smart_out or ""))
         smart_out = _final_clean_plain(src_text, smart_out, target_code)
-    except Exception:
-        logger.exception("smart_translate failed; fallback to legacy prompt")
+    except Exception as e:
+        logger.exception("[translate] smart_translate FAILED: %s", e)
         smart_out = ""
 
     if smart_out:
