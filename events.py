@@ -1,3 +1,4 @@
+# events.py
 import os
 import logging
 import re
@@ -35,6 +36,35 @@ from config import GOOGLE_API_KEY, GCS_BUCKET_NAME, STT_DAILY_LIMIT_SECONDS, TZ
 from stt_select_panel import STTLanguagePanel, _to_stt_code
 
 logger = logging.getLogger(__name__)
+
+# --- STT helpers (auto long-running + alt-langs) ---
+_COMPRESSED_EXTS = {".mp3", ".m4a", ".ogg", ".opus", ".webm", ".mp4"}
+
+def _is_compressed(name: str, content_type: str) -> bool:
+    n = (name or "").lower()
+    ct = (content_type or "").lower()
+    return (
+        any(n.endswith(ext) for ext in _COMPRESSED_EXTS)
+        or ct.startswith("audio/ogg")
+        or ct.startswith("audio/webm")
+        or ct.startswith("audio/mpeg")
+        or ct.startswith("video/mp4")
+    )
+
+def _should_force_longrun(size_bytes: int, name: str, content_type: str) -> bool:
+    # ไฟล์บีบอัด > ~1.8MB มักยาวเกิน 1 นาที → บังคับ long-running
+    if _is_compressed(name, content_type):
+        return size_bytes > 1_800_000
+    # ไฟล์ไม่บีบอัด (wav/flac) ใช้เพดานเดิม
+    return size_bytes > 9_000_000
+
+def _ensure_alts_for_code_switch(base_lang_code: str, alt_iso: list[str] | None) -> list[str]:
+    alts = list(alt_iso or [])
+    # ไทยปนอังกฤษบ่อย → เติม en
+    if (base_lang_code or "").lower().startswith("th") and "en" not in [a.split("-")[0].lower() for a in alts]:
+        alts = ["en"] + alts
+    # จำกัด 3 ตัวตามที่โค้ดรองรับ
+    return alts[:3]
 
 def register_message_handlers(bot):
     @bot.listen("on_message")
@@ -104,6 +134,8 @@ def register_message_handlers(bot):
                 async def _run_stt_with_lang(interaction, base_lang_code: str):
                     """
                     ถอดเสียงตามภาษาที่ผู้ใช้เลือก + โควต้า STT ต่อวันใน Redis
+                    - เลือก long-running อัตโนมัติสำหรับไฟล์บีบอัด > ~1.8MB
+                    - ใส่ alternativeLanguageCodes ตั้งแต่รอบแรก (ไทย → เติม en)
                     """
                     flag = FLAGS.get(base_lang_code, FLAGS.get(base_lang_code.split("-")[0], "")) or ""
                     progress_msg = None
@@ -165,7 +197,7 @@ def register_message_handlers(bot):
                         audio_bytes, fn, ctype, did_trans = await ensure_stt_compatible(filename, content_type, raw_bytes)
                         filename2, content_type2 = fn, ctype
 
-                        # เดา alts จากบริบท/ประวัติ
+                        # เดา alts จากบริบท/ประวัติ และเติมสำหรับ code-switch
                         context_bias = detect_lang_hints_from_context(
                             username=str(message.author),
                             channel_name=getattr(message.channel, "name", "") or "",
@@ -179,15 +211,15 @@ def register_message_handlers(bot):
                             channel_hist=channel_hist, user_hist=user_hist,
                             context_bias=context_bias,
                         )
+                        # ใส่ en สำหรับไทย และจำกัด 3 ตัว
+                        alt_iso_first = _ensure_alts_for_code_switch(base_lang_code, alt_iso)
 
-                        alt_bcp = [_to_stt_code(c) for c in (alt_iso or [])[:3]]
-
-                        # เลือกโหมดจากขนาดไฟล์ (ประมาณ)
-                        use_long = len(audio_bytes) > 9_000_000
+                        # เลือกโหมดด้วยเฮอร์ริสติก (บีบอัด > 1.8MB → long-running)
+                        use_long = _should_force_longrun(len(audio_bytes), filename2, content_type2)
                         stt_mode = "google longrunning" if use_long else "google sync"
                         await _status(f"กำลังเริ่มถอดเสียง… (โหมด: {stt_mode})")
 
-                        # longrunning → บังคับ mono 16k
+                        # longrunning → แปลง wav 16k mono เพื่อความชัวร์
                         if use_long:
                             try:
                                 audio_bytes = await transcode_to_wav_pcm16(
@@ -200,9 +232,9 @@ def register_message_handlers(bot):
                                 # ไม่ล้มงาน
                                 pass
 
-                        async def _run_once(alts):
-                            # แปลง ISO → BCP-47 ตรงนี้
-                            alts_bcp = [_to_stt_code(c) for c in (alts or [])[:3]]
+                        async def _run_once(alts_iso: list[str] | None):
+                            # แปลง ISO → BCP-47
+                            alts_bcp = [_to_stt_code(c) for c in (alts_iso or [])[:3]]
                         
                             if use_long:
                                 lr_kwargs = dict(
@@ -240,9 +272,9 @@ def register_message_handlers(bot):
                                                        enable_separate_recognition_per_channel=False)
                                 return await stt_transcribe_bytes(**sync_kwargs)
 
-                        # รอบ 1: strict
+                        # รอบ 1: ใช้ alt-langs ตั้งแต่แรก (ช่วย code-switch)
                         await _status("กำลังถอดเสียง…")
-                        text, raw = await _run_once(None)
+                        text, raw = await _run_once(alt_iso_first)
 
                         # ถ้า error ฝั่ง API
                         if text.startswith("❌") or (isinstance(raw, dict) and raw.get("error")):
@@ -261,14 +293,14 @@ def register_message_handlers(bot):
                             await stt_refund(user_id, guild_id, reserved_sec, TZ)
                             return
 
-                        # รอบ 2: strict + alts
-                        if not (text or "").strip():
+                        # รอบ 2: ยังว่าง → ลองชุด alt จากสถิติเต็ม ๆ
+                        if not (text or "").strip() and (alt_iso or []):
                             await _status("ยังไม่ได้ข้อความ ลองอีกครั้งด้วยภาษาใกล้เคียง…")
                             text2, raw2 = await _run_once(alt_iso)
                             if (text2 or "").strip():
                                 text, raw = text2, raw2
 
-                        # รอบ 3: transcode ใหม่แล้วลอง
+                        # รอบ 3: transcode ใหม่แล้วลอง (หากตอนแรกยังไม่ได้และเรายังไม่ได้แปลง)
                         if not (text or "").strip() and not did_trans:
                             try:
                                 await _status("กำลังปรับรูปแบบเสียงใหม่ แล้วลองอีกครั้ง…")
@@ -279,14 +311,14 @@ def register_message_handlers(bot):
                                 )
                                 filename2 = f"{os.path.splitext(filename2)[0]}.wav"
                                 content_type2 = "audio/wav"
-                                use_long = len(reb_bytes) > 9_000_000
-                                stt_mode = "google longrunning" if use_long else "google sync"
-
-                                # ใช้ reb_bytes แทน
                                 audio_bytes = reb_bytes
 
-                                t3, r3 = await _run_once(None)
-                                if not (t3 or "").strip():
+                                # ประเมินโหมดใหม่จากขนาดจริงหลังแปลง
+                                use_long = _should_force_longrun(len(reb_bytes), filename2, content_type2)
+                                stt_mode = "google longrunning" if use_long else "google sync"
+
+                                t3, r3 = await _run_once(alt_iso_first)
+                                if not (t3 or "").strip() and (alt_iso or []):
                                     t4, r4 = await _run_once(alt_iso)
                                     text, raw = (t4, r4) if (t4 or "").strip() else (t3, r3)
                                 else:
