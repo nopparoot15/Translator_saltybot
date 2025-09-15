@@ -1,3 +1,4 @@
+# tone_translate.py
 from __future__ import annotations
 import re
 from dataclasses import dataclass
@@ -6,41 +7,65 @@ from typing import Dict, List, Tuple
 Lang = str
 
 # =========================================================
-# Render dictionary per language (เลือกคำแทนแท็กให้ “เป็นธรรมชาติ”)
-# ถ้าภาษาไหนไม่มี จะ fallback เป็น EN อัตโนมัติ
+# ภาค Render: คำแทนแท็กของแต่ละภาษา (เลือกให้ "เป็นธรรมชาติ")
+# ถ้าไม่พบภาษานั้น จะ fallback เป็น EN อัตโนมัติ
 # =========================================================
 TAG_RENDER: Dict[Lang, Dict[str, List[str]]] = {
     "th": {
-        "BRO": ["มึง", "แก"], "HUH": ["วะ", "ว่ะ", "นะ"], "LOL": ["555", "ฮ่าๆ"],
-        "KINDOF": ["เหมือนจะ", "ค่อนข้าง"], "SARC": ["(ประชด)"],
+        "BRO": ["มึง", "แก"],
+        "HUH": ["วะ", "ว่ะ", "นะ"],
+        "LOL": ["555", "ฮ่าๆ"],
+        "KINDOF": ["เหมือนจะ", "ค่อนข้าง"],
+        "SARC": ["(ประชด)"],
     },
     "en": {
-        "BRO": ["bro", "dude", "man"], "HUH": ["huh", "right"], "LOL": ["lol", "haha", "lmao"],
-        "KINDOF": ["kinda", "sort of", "low-key"], "SARC": ["(sarcasm)"],
+        "BRO": ["bro", "dude", "man"],
+        "HUH": ["huh", "right"],
+        "LOL": ["lol", "haha", "lmao"],
+        "KINDOF": ["kinda", "sort of", "low-key"],
+        "SARC": ["(sarcasm)"],
     },
     "ja": {
-        "BRO": ["お前", "君"], "HUH": ["な", "ね", "よな"], "LOL": ["笑", "草"],
-        "KINDOF": ["なんか", "ちょっと"], "SARC": ["（皮肉）"],
+        "BRO": ["お前", "君"],
+        "HUH": ["な", "ね", "よな"],
+        "LOL": ["笑", "草"],
+        "KINDOF": ["なんか", "ちょっと"],
+        "SARC": ["（皮肉）"],
     },
     "zh": {
-        "BRO": ["哥们", "兄弟", "老铁"], "HUH": ["吧", "嘛"], "LOL": ["哈哈", "笑死"],
-        "KINDOF": ["有点", "有那么点"], "SARC": ["（讽刺）"],
+        "BRO": ["哥们", "兄弟", "老铁"],
+        "HUH": ["吧", "嘛"],
+        "LOL": ["哈哈", "笑死"],
+        "KINDOF": ["有点", "有那么点"],
+        "SARC": ["（讽刺）"],
     },
     "ko": {
-        "BRO": ["야", "브로"], "HUH": ["냐", "지"], "LOL": ["ㅋㅋ", "ㅎㅎ"],
-        "KINDOF": ["약간", "좀"], "SARC": ["(비꼼)"],
+        "BRO": ["야", "브로"],
+        "HUH": ["냐", "지"],
+        "LOL": ["ㅋㅋ", "ㅎㅎ"],
+        "KINDOF": ["약간", "좀"],
+        "SARC": ["(비꼼)"],
     },
     "vi": {
-        "BRO": ["mày", "ông"], "HUH": ["hả", "nhỉ"], "LOL": ["haha", "kkk"],
-        "KINDOF": ["kiểu như", "hơi bị"], "SARC": ["(mỉa mai)"],
+        "BRO": ["mày", "ông"],
+        "HUH": ["hả", "nhỉ"],
+        "LOL": ["haha", "kkk"],
+        "KINDOF": ["kiểu như", "hơi bị"],
+        "SARC": ["(mỉa mai)"],
     },
     "fil": {
-        "BRO": ["pre", "pare", "tol"], "HUH": ["no?", "ha?"], "LOL": ["haha", "lmao"],
-        "KINDOF": ["parang", "medyo"], "SARC": ["(sarkasmo)"],
+        "BRO": ["pre", "pare", "tol"],
+        "HUH": ["no?", "ha?"],
+        "LOL": ["haha", "lmao"],
+        "KINDOF": ["parang", "medyo"],
+        "SARC": ["(sarkasmo)"],
     },
     "id": {
-        "BRO": ["bro", "bang"], "HUH": ["kan?", "ya?"], "LOL": ["wkwk", "haha"],
-        "KINDOF": ["kayak", "agak"], "SARC": ["(nyinyir)"],
+        "BRO": ["bro", "bang"],
+        "HUH": ["kan?", "ya?"],
+        "LOL": ["wkwk", "haha"],
+        "KINDOF": ["kayak", "agak"],
+        "SARC": ["(nyinyir)"],
     },
     "fr": { "BRO": ["mec", "frère"], "HUH": ["hein", "non?"], "LOL": ["mdr", "haha"], "KINDOF": ["un peu", "genre"], "SARC": ["(sarcasme)"] },
     "de": { "BRO": ["Alter", "Digga"], "HUH": ["oder?", "ne?"], "LOL": ["lol", "haha"], "KINDOF": ["irgendwie", "ein bisschen"], "SARC": ["(Sarkasmus)"] },
@@ -55,9 +80,28 @@ TAG_RENDER: Dict[Lang, Dict[str, List[str]]] = {
     "my": { "BRO": ["ရေ"], "HUH": ["လား", "နော်"], "LOL": ["ဟားဟား"], "KINDOF": ["အနည်းငယ်"], "SARC": ["(သံယောဇဥ်)"] },
     "ar": { "BRO": ["يا زلمة", "يا صاح"], "HUH": ["ها؟", "مش كده؟"], "LOL": ["هههه", "لول"], "KINDOF": ["شوية", "كده"], "SARC": ["(سخرية)"] },
 }
-# alias
 TAG_RENDER["fil-PH"] = TAG_RENDER["fil"]
 TAG_RENDER["tl"] = TAG_RENDER["fil"]
+
+# =========================================================
+# Helpers
+# =========================================================
+def _pick(lang: Lang, key: str) -> str:
+    lst = TAG_RENDER.get(lang, TAG_RENDER["en"]).get(key) or TAG_RENDER["en"].get(key, [])
+    return lst[0] if lst else ""
+
+_TAG_NAME_RE = re.compile(r"<([A-Z_]+)>")
+
+def _collect_tags(s: str) -> set[str]:
+    return set(_TAG_NAME_RE.findall(s or ""))
+
+def _strip_unallowed_tags(text: str, allowed: set[str]) -> str:
+    if not text:
+        return text
+    def _repl(m: re.Match) -> str:
+        tag = m.group(1)
+        return f"<{tag}>" if tag in allowed else ""
+    return _TAG_NAME_RE.sub(_repl, text)
 
 # =========================================================
 # 1) PRE-ANNOTATE — ใส่แท็กจากข้อความต้นฉบับ
@@ -69,22 +113,19 @@ class ToneHints:
     intensity: str = "normal"  # soft|normal|hard
     style: str = "preserve"    # preserve|neutralize
 
+# สัญญาณตรวจจับแบบกว้าง ๆ
 _TAGS = {
     "BRO": r"(มึง|แก|เอ็ง|\b(bro|dude|man)\b|お前|哥们|兄弟|老铁|야|mày|pre|tol|bang|wey|mano|stary|чувак|يا زلمة)",
     "LOL": r"(555+|ฮ่า+|ขำ|\blol\b|\blmao\b|haha|草|笑|ㅋㅋ+|ㅎㅎ+|jaja|xd|\bkkk\b|mdr|xD|лол|ахаха|هههه)",
     "KINDOF": r"(เหมือนจะ|ค่อนข้าง|นิดหน่อย)|\b(kinda|sort of|low[- ]?key)\b|なんか|ちょっと|有点|약간|parang|medyo|kayak|agak|un poco|irgendwie|medio|tipo|meio que|trochę|ніби|типа|شوية",
-    # ตัวลงท้าย/หยอกล้อ → ถ้าอยู่ท้ายประโยคจะเติม <HUH>
+    # ลงท้ายเชิงแหย่/ย้ำ
     "HUH_END": r"(วะ|ว่ะ|นะ|ปะ|หรือไง)\s*$|(?:\b(huh|right|eh)\b|¿no\?|né\?)\s*$|[なね]？?$|吧?$|냐\?$",
     "SARC": r"(ประชด|แดกดัน)|\(sarcasm\)|皮肉|讽刺|비꼼|sarkasmo|Sarkasmus|sarcasmo|сарказм|سخرية",
 }
 
-def _pick(lang: Lang, key: str) -> str:
-    cand = TAG_RENDER.get(lang, TAG_RENDER["en"]).get(key) or TAG_RENDER["en"].get(key, [])
-    return cand[0] if cand else ""
-
 def pre_annotate(text: str, src_lang: Lang) -> Tuple[str, ToneHints]:
     """
-    ตรวจคำสแลงแบบกว้าง ๆ แล้วแปะแท็ก <BRO> <LOL> <KINDOF> และ <HUH> (ถ้าลงท้าย)
+    ตรวจคำสแลง/รูปประโยค แล้วแปะแท็ก <BRO> <LOL> <KINDOF> และ <HUH> (ถ้าเข้าเงื่อนไข)
     """
     t = (text or "").strip()
     hints = ToneHints()
@@ -118,10 +159,11 @@ def build_tone_prompt(src: Lang, tgt: Lang) -> str:
     return (
         "You are a tone-preserving translator.\n"
         "RULES:\n"
-        "1) Preserve slang/register, teasing/sarcasm if present.\n"
+        "1) Preserve slang/register and teasing/sarcasm if present.\n"
         "2) NEVER translate or remove tags: <BRO>, <HUH>, <LOL>, <KINDOF>, <SARC>.\n"
-        "3) Translate the rest naturally into the target language.\n"
-        "4) Return ONLY the translated text with the tags kept.\n"
+        "3) Do NOT invent new tags; only keep tags already present in the input.\n"
+        "4) Translate the rest naturally into the target language.\n"
+        "5) Return ONLY the translated text with the tags kept.\n"
         f"Source={src} Target={tgt}\n"
     )
 
@@ -140,13 +182,14 @@ def build_natural_prompt(src: Lang, tgt: Lang, hints: ToneHints) -> str:
     return (
         "You are a **tone-preserving, natural translator**.\n"
         "Goals:\n"
-        "1) Preserve register (casual/rude/polite), teasing/sarcasm, slang strength.\n"
+        "1) Preserve register (casual/rude/polite), teasing/sarcasm, and slang strength.\n"
         "2) Make the target sentence sound NATURAL for native speakers.\n"
         "3) NEVER translate/remove angle-bracket tags (<BRO>, <HUH>, <LOL>, <KINDOF>, <SARC>).\n"
-        "4) Choose idiomatic equivalents for slang/insults common in the target language.\n"
+        "4) Do NOT invent new tags; only keep tags already present in the input.\n"
+        "5) Choose idiomatic equivalents for slang/insults common in the target language.\n"
         f"{style_line}{intensity_line}"
         f"Source={src} Target={tgt}\n"
-        "Return ONLY the translated text with tags kept."
+        "Return ONLY the translated text with the tags kept."
     )
 
 # =========================================================
@@ -176,7 +219,7 @@ def post_render(text: str, tgt_lang: Lang) -> str:
     return out.strip()
 
 # =========================================================
-# 4) SMART TRANSLATE — Entry point ที่ translation_service เรียกใช้
+# 4) SMART TRANSLATE — Entry point สำหรับ translation_service
 # =========================================================
 @dataclass
 class _Hints(ToneHints):
@@ -204,10 +247,13 @@ async def smart_translate(
     assert llm_translate_callable is not None, "smart_translate requires llm_translate_callable"
 
     annotated, hints = _pre_annotate_natural(text or "", src, style=style)
-    system_prompt = build_natural_prompt(src, tgt, hints) if natural_pass else build_tone_prompt(src, tgt)
+    allowed_tags = _collect_tags(annotated)  # <--- อนุญาตเฉพาะแท็กที่เราติดไว้
 
-    # แปล (ให้ LLM คงแท็กไว้)
+    system_prompt = build_natural_prompt(src, tgt, hints) if natural_pass else build_tone_prompt(src, tgt)
     raw = await llm_translate_callable(annotated, src, tgt, engine, system_prompt=system_prompt)
+
+    # ลบแท็กที่ LLM เผลอแถมมา (เช่น <HUH> ทั้งที่เราไม่ได้ใส่)
+    raw = _strip_unallowed_tags(raw, allowed_tags)
 
     # เรนเดอร์แท็กเป็นสำนวนปลายทาง
     return post_render(raw, tgt)
