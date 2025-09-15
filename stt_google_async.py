@@ -1,69 +1,70 @@
-# stt_google_sync.py
+# stt_google_async.py
 # ------------------------------------------------------------
-# Google Speech-to-Text (Synchronous)
-# ใช้กับไฟล์ "สั้น/ขนาดไม่ใหญ่มาก" (≤ ~1 นาที หรือ ≤ ~8-9MB)
-# ถ้าไฟล์ยาว/ใหญ่ ระบบนี้จะ fallback ไปใช้ long-running (stt_google_async)
-#
-# Public APIs:
-#   - stt_transcribe_bytes(...) -> (text, raw_json)
-#   - stt_transcribe_file(path, ...) -> (text, raw_json)
+# Google Speech-to-Text (Long Running) for LONG audio (e.g. 10+ minutes)
+# Flow:
+#   1) Upload bytes -> GCS object (using service account access token)
+#   2) Call speech:longrunningrecognize with gs:// URI (OAuth Bearer)
+#   3) Poll operation until done, return (transcript, raw_json)
 # ------------------------------------------------------------
 
 from __future__ import annotations
 
-import base64
 import os
+import uuid
+import asyncio
 from typing import Optional, Tuple, Dict, Any, List
-import httpx
 
-# ✅ ใช้ long-running อัตโนมัติเมื่อ sync ใช้ไม่ได้
-from stt_google_async import transcribe_long_audio_bytes as _stt_longrun
+import httpx
+import google.auth
+from google.auth.transport.requests import Request
 
 # ---------- Helpers ----------
-def _guess_mime_by_ext(filename: Optional[str], content_type: Optional[str]) -> str:
-    if content_type:
-        return content_type
-    name = (filename or "").lower()
-    if name.endswith(".wav"):  return "audio/wav"
-    if name.endswith(".flac"): return "audio/flac"
-    if name.endswith(".mp3"):  return "audio/mpeg"
-    if name.endswith(".m4a"):  return "audio/mp4"      # บางระบบรายงานเป็น audio/mp4
-    if name.endswith(".aac"):  return "audio/aac"
-    if name.endswith(".ogg") or name.endswith(".opus"): return "audio/ogg"
-    if name.endswith(".webm"): return "audio/webm"
-    if name.endswith(".mp4"):  return "video/mp4"      # เผื่ออัพเป็น mp4 ที่มีแค่เสียง
+
+def _guess_mime_by_ext(ext: str) -> str:
+    ext = (ext or "").lower()
+    if ext.endswith(".wav"):  return "audio/wav"
+    if ext.endswith(".flac"): return "audio/flac"
+    if ext.endswith(".mp3"):  return "audio/mpeg"
+    if ext.endswith(".m4a"):  return "audio/mp4"
+    if ext.endswith(".aac"):  return "audio/aac"
+    if ext.endswith(".ogg"):  return "audio/ogg"
+    if ext.endswith(".opus"): return "audio/ogg"
+    if ext.endswith(".webm"): return "audio/webm"
+    if ext.endswith(".mp4"):  return "video/mp4"
     return "application/octet-stream"
 
-def _mime_to_encoding(mime: str, filename: Optional[str]) -> str:
+def _mime_to_encoding(mime: str, file_ext: Optional[str]) -> str:
     """
-    Map MIME/extension → Speech-to-Text RecognitionConfig.encoding
+    Map MIME/extension -> Speech-to-Text RecognitionConfig.encoding
     https://cloud.google.com/speech-to-text/docs/reference/rest/v1/RecognitionConfig#AudioEncoding
     """
     m = (mime or "").lower()
-    name = (filename or "").lower()
+    name = (file_ext or "").lower()
+
     # OPUS in containers first
     if "webm" in m or name.endswith(".webm"):
         return "WEBM_OPUS"
     if "ogg" in m or name.endswith(".ogg") or name.endswith(".opus"):
         return "OGG_OPUS"
+
     if "mpeg" in m or name.endswith(".mp3"):
         return "MP3"
     if "flac" in m or name.endswith(".flac"):
         return "FLAC"
     if "wav" in m or name.endswith(".wav"):
-        return "LINEAR16"  # PCM ใน .wav
-    # AAC/MP4 อาจถอดไม่ตรง → แนะนำ transcode เป็น WAV ถ้าเจอปัญหา
+        return "LINEAR16"
+
+    # AAC/MP4 มักถอดไม่ตรง ให้ปล่อยเดา (หรือควร transcode เป็น wav ก่อน)
     return "ENCODING_UNSPECIFIED"
 
 def _norm_lang(code: Optional[str]) -> Optional[str]:
-    """ทำให้ languageCode เป็น BCP-47 ที่ Google STT ชอบ"""
     if not code:
         return None
     mapping = {
         "th": "th-TH",
         "en": "en-US",
         "ja": "ja-JP",
-        "zh": "cmn-Hans-CN",   # จีนกลาง (ตัวง่าย); ถ้าต้องจีนไต้หวัน: 'cmn-Hant-TW'
+        "zh": "cmn-Hans-CN",
         "ko": "ko-KR",
         "vi": "vi-VN",
         "ru": "ru-RU",
@@ -80,276 +81,230 @@ def _norm_lang(code: Optional[str]) -> Optional[str]:
     base = code.strip().lower().split("-")[0]
     return mapping.get(base, code)
 
-def _guess_ext(filename: Optional[str], mime: str) -> str:
-    """เดา .ext สำหรับส่งให้ long-running"""
-    if filename:
-        ext = os.path.splitext(filename)[1].lower()
-        if ext:
-            return ext
-    m = (mime or "").lower()
-    if "mpeg" in m: return ".mp3"
-    if "ogg" in m:  return ".ogg"
-    if "webm" in m: return ".webm"
-    if "wav" in m:  return ".wav"
-    if "flac" in m: return ".flac"
-    if "mp4" in m:  return ".m4a"
-    return ".wav"
+async def _get_access_token(scope: str = "https://www.googleapis.com/auth/cloud-platform") -> str:
+    creds, _ = google.auth.default(scopes=[scope])
+    if not creds.valid:
+        request = Request()
+        creds.refresh(request)
+    return creds.token
 
-def _build_config(
+# ---------- GCS Upload ----------
+
+async def _gcs_simple_upload(
     *,
-    language_code: str,
-    enable_punctuation: bool,
-    max_alternatives: int,
-    diarization_speaker_count: Optional[int],
-    profanity_filter: Optional[bool],
-    audio_channel_count: Optional[int],
-    enable_separate_recognition_per_channel: Optional[bool],
-    model: Optional[str],
-    use_enhanced: Optional[bool],
-    encoding: str,
-    alternative_language_codes: Optional[List[str]] = None,
-    sample_rate_hz: Optional[int] = None,
+    bucket: str,
+    obj_name: str,
+    content: bytes,
+    content_type: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """สร้าง RecognitionConfig สำหรับ REST /speech:recognize"""
-    cfg: Dict[str, Any] = {
-        "languageCode": language_code,                         # ต้องมีเสมอ
-        "enableAutomaticPunctuation": bool(enable_punctuation),
-        "maxAlternatives": int(max_alternatives),
-        "encoding": encoding,                                  # ใส่ให้ชัด
+    if not content_type:
+        content_type = "application/octet-stream"
+
+    token = await _get_access_token("https://www.googleapis.com/auth/devstorage.read_write")
+    url = f"https://storage.googleapis.com/upload/storage/v1/b/{bucket}/o?uploadType=media&name={obj_name}"
+
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": content_type,
+    }
+
+    async with httpx.AsyncClient(timeout=httpx.Timeout(60.0)) as client:
+        r = await client.post(url, headers=headers, content=content)
+        r.raise_for_status()
+        return r.json()
+
+# ---------- Speech Longrunning ----------
+
+async def _speech_longrunning_start(
+    *,
+    gcs_uri: str,
+    language_code: str,   # <-- บังคับต้องมี
+    alternative_language_codes: Optional[List[str]] = None,
+    enable_automatic_punctuation: bool = True,
+    diarization_speaker_count: Optional[int] = None,
+    model: Optional[str] = None,
+    use_enhanced: Optional[bool] = None,
+    audio_channel_count: Optional[int] = None,
+    enable_separate_recognition_per_channel: Optional[bool] = None,
+    profanity_filter: Optional[bool] = None,
+    speech_contexts: Optional[List[Dict[str, Any]]] = None,
+    encoding: str = "ENCODING_UNSPECIFIED",
+) -> Dict[str, Any]:
+    token = await _get_access_token("https://www.googleapis.com/auth/cloud-platform")
+    url = "https://speech.googleapis.com/v1/speech:longrunningrecognize"
+
+    config: Dict[str, Any] = {
+        "languageCode": language_code,                         # ✅ require
+        "enableAutomaticPunctuation": bool(enable_automatic_punctuation),
+        "encoding": encoding,                                   # ✅ ใส่ให้ชัด
     }
     if alternative_language_codes:
-        cfg["alternativeLanguageCodes"] = alternative_language_codes
-    if sample_rate_hz:
-        cfg["sampleRateHertz"] = int(sample_rate_hz)           # กรณี Opus ต้องกำหนด (เช่น 48000)
+        config["alternativeLanguageCodes"] = alternative_language_codes
     if diarization_speaker_count:
-        cfg["diarizationConfig"] = {
+        config["diarizationConfig"] = {
             "enableSpeakerDiarization": True,
             "minSpeakerCount": max(1, diarization_speaker_count),
             "maxSpeakerCount": max(1, diarization_speaker_count),
         }
-    if profanity_filter is not None:
-        cfg["profanityFilter"] = bool(profanity_filter)
-    if audio_channel_count:
-        cfg["audioChannelCount"] = int(audio_channel_count)
-    if enable_separate_recognition_per_channel is not None:
-        cfg["enableSeparateRecognitionPerChannel"] = bool(enable_separate_recognition_per_channel)
     if model:
-        cfg["model"] = model
+        config["model"] = model
     if use_enhanced is not None:
-        cfg["useEnhanced"] = bool(use_enhanced)
-    # หมายเหตุ: sampleRateHertz ต้อง "ตรงกับไฟล์จริง" เท่านั้น ถ้าไม่ชัวร์อย่าใส่
-    return cfg
+        config["useEnhanced"] = bool(use_enhanced)
+    if audio_channel_count:
+        config["audioChannelCount"] = int(audio_channel_count)
+    if enable_separate_recognition_per_channel is not None:
+        config["enableSeparateRecognitionPerChannel"] = bool(enable_separate_recognition_per_channel)
+    if profanity_filter is not None:
+        config["profanityFilter"] = bool(profanity_filter)
+    if speech_contexts:
+        config["speechContexts"] = speech_contexts
 
-def _resolve_bucket(name: Optional[str]) -> Optional[str]:
-    """คืนชื่อบัคเก็ต: ใช้ parameter ก่อน, ถ้าไม่มีลอง ENV"""
-    return name or os.getenv("GCS_BUCKET_NAME") or os.getenv("GOOGLE_CLOUD_STORAGE_BUCKET")
+    payload = {"config": config, "audio": {"uri": gcs_uri}}
 
-def _should_force_longrun(encoding: str, size_bytes: int) -> bool:
-    """
-    ถ้าเป็นไฟล์บีบอัด (MP3/OGG/WEBM/M4A) และขนาดเกิน ~1.8MB
-    มีโอกาสสูงว่าเกิน 1 นาที → บังคับใช้ long-running เลย
-    """
-    if encoding in ("MP3", "OGG_OPUS", "WEBM_OPUS", "ENCODING_UNSPECIFIED"):
-        return size_bytes > 1_800_000
-    # WAV/FLAC ไม่บีบอัด ใช้เกณฑ์เดิม
-    return size_bytes > 9_000_000
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
+    }
 
-# ---------- Public APIs ----------
-async def stt_transcribe_bytes(
+    async with httpx.AsyncClient(timeout=httpx.Timeout(60.0)) as client:
+        r = await client.post(url, headers=headers, json=payload)
+        if r.status_code != 200:
+            raise RuntimeError(f"❌ Speech start failed (HTTP {r.status_code}): {r.text[:800]}")
+        return r.json()
+
+async def _speech_poll_operation(
+    *,
+    name: str,
+    max_wait_sec: float = 900.0,
+    interval_sec: float = 5.0
+) -> Dict[str, Any]:
+    token = await _get_access_token("https://www.googleapis.com/auth/cloud-platform")
+    url = f"https://speech.googleapis.com/v1/operations/{name}"
+    headers = {"Authorization": f"Bearer {token}"}
+
+    waited = 0.0
+    async with httpx.AsyncClient(timeout=httpx.Timeout(60.0)) as client:
+        while waited < max_wait_sec:
+            r = await client.get(url, headers=headers)
+            r.raise_for_status()
+            data = r.json()
+            if data.get("done"):
+                return data
+            await asyncio.sleep(interval_sec)
+            waited += interval_sec
+
+    return {"done": False, "error": {"message": "timeout while polling speech operation"}}
+
+def _join_transcript_from_operation(op: Dict[str, Any]) -> str:
+    if not op or not op.get("done"):
+        return ""
+    if "error" in op:
+        return ""
+    resp = op.get("response") or {}
+    results = resp.get("results") or []
+    out: List[str] = []
+    for res in results:
+        alts = res.get("alternatives") or []
+        if not alts:
+            continue
+        t = (alts[0].get("transcript") or "").strip()
+        if t:
+            out.append(t)
+    return " ".join(out).strip()
+
+# ---------- Public entry ----------
+
+async def transcribe_long_audio_bytes(
     audio_bytes: bytes,
     *,
-    api_key: Optional[str] = None,
-    filename: Optional[str] = None,
+    file_ext: str = ".wav",
     content_type: Optional[str] = None,
-    # การตั้งค่าทั่วไป
-    lang_hint: Optional[str] = None,                 # เช่น "th-TH", "en-US"
-    enable_punctuation: bool = True,
-    max_alternatives: int = 1,
-    # ตัวเลือกเสริม
-    diarization_speaker_count: Optional[int] = None,
-    profanity_filter: Optional[bool] = None,
-    audio_channel_count: Optional[int] = None,
-    enable_separate_recognition_per_channel: Optional[bool] = None,
-    model: Optional[str] = None,
-    use_enhanced: Optional[bool] = None,
-    alternative_language_codes: Optional[List[str]] = None,
-    sample_rate_hz: Optional[int] = None,            # ⭐ กำหนด sample rate เมื่อจำเป็น (Opus)
-    timeout_s: float = 120.0,
-    # ⭐ ให้ระบุ bucket เพื่อ fallback อัตโนมัติไป long-running เมื่อ sync ใช้ไม่ได้
-    fallback_async_bucket_name: Optional[str] = None,
-) -> Tuple[str, Dict[str, Any]]:
-    """
-    ถอดเสียงแบบ synchronous ผ่าน REST API
-    แนะนำใช้กับไฟล์สั้น หรือขนาดไม่ใหญ่มาก (≤ ~1 นาที หรือ ≤ ~8-9MB)
-    Return: (text, raw_json_response). ถ้า sync ใช้ไม่ได้:
-      - จะลองอ่านชื่อบัคเก็ตจาก fallback_async_bucket_name หรือ ENV แล้ว fallback ไป long-running อัตโนมัติ
-    """
-    key = api_key or os.getenv("GOOGLE_API_KEY", "")
-    if not key:
-        return "❌ Missing GOOGLE_API_KEY", {}
-
-    bucket = _resolve_bucket(fallback_async_bucket_name)
-
-    # ⛔ sync เหมาะกับไฟล์ไม่เกิน ~9MB (base64 แล้วจะพองอีก)
-    if len(audio_bytes or b"") > 9_000_000:
-        if bucket:
-            # ส่งต่อไป long-running
-            mime = _guess_mime_by_ext(filename, content_type)
-            ext = _guess_ext(filename, mime)
-            language_code = _norm_lang(lang_hint) or "th-TH"
-            # เติม en-US ให้อัตโนมัติกรณีไทยปนอังกฤษ
-            alt_codes = alternative_language_codes
-            if language_code.startswith("th") and (not alt_codes or "en-US" not in alt_codes):
-                alt_codes = ["en-US"] + (alt_codes or [])
-            text, raw = await _stt_longrun(
-                audio_bytes,
-                file_ext=ext,
-                content_type=mime,
-                bucket_name=bucket,
-                lang_hint=language_code,
-                alternative_language_codes=alt_codes,
-            )
-            return text, raw
-        return "❌ Audio too large for synchronous STT (use long-running)", {"hint": "set GCS_BUCKET_NAME env or pass fallback_async_bucket_name"}
-
-    mime = _guess_mime_by_ext(filename, content_type)
-    encoding = _mime_to_encoding(mime, filename)
-
-    # สำหรับ Opus (OGG/WEBM) Google ต้องการ sampleRateHertz ชัดเจน → 48000
-    if sample_rate_hz is None and encoding in ("OGG_OPUS", "WEBM_OPUS"):
-        sample_rate_hz = 48000
-
-    # ภาษา: ถ้า caller ไม่ส่งมา ให้ default เป็นไทย และ normalize ให้ Google ชอบ
-    language_code = _norm_lang(lang_hint) or "th-TH"
-
-    # ⭐ บังคับไป long-running เลยถ้าไฟล์บีบอัดและน่าจะยาวเกิน 1 นาที
-    if bucket and _should_force_longrun(encoding, len(audio_bytes or b"")):
-        ext = _guess_ext(filename, mime)
-        alt_codes = alternative_language_codes
-        if language_code.startswith("th") and (not alt_codes or "en-US" not in alt_codes):
-            alt_codes = ["en-US"] + (alt_codes or [])
-        text, raw = await _stt_longrun(
-            audio_bytes,
-            file_ext=ext,
-            content_type=mime,
-            bucket_name=bucket,
-            lang_hint=language_code,
-            alternative_language_codes=alt_codes,
-        )
-        return text, raw
-
-    # Base64 audio (ไปทาง sync)
-    b64 = base64.b64encode(audio_bytes).decode("utf-8")
-
-    config = _build_config(
-        language_code=language_code,
-        enable_punctuation=enable_punctuation,
-        max_alternatives=max_alternatives,
-        diarization_speaker_count=diarization_speaker_count,
-        profanity_filter=profanity_filter,
-        audio_channel_count=audio_channel_count,
-        enable_separate_recognition_per_channel=enable_separate_recognition_per_channel,
-        model=model,
-        use_enhanced=use_enhanced,
-        encoding=encoding,
-        alternative_language_codes=alternative_language_codes,
-        sample_rate_hz=sample_rate_hz,
-    )
-
-    payload: Dict[str, Any] = {"config": config, "audio": {"content": b64}}
-    url = f"https://speech.googleapis.com/v1/speech:recognize?key={key}"
-    timeout = httpx.Timeout(connect=10.0, read=timeout_s, write=10.0, pool=5.0)
-
-    try:
-        async with httpx.AsyncClient(timeout=timeout) as client:
-            resp = await client.post(url, json=payload, headers={"Content-Type": "application/json; charset=utf-8"})
-        if resp.status_code != 200:
-            # ถ้าเป็นเคสยาวเกิน ให้ fallback ไป long-running อัตโนมัติ (ใช้ ENV ถ้าไม่ได้ส่งพารามิเตอร์)
-            body = resp.text or ""
-            if bucket and resp.status_code == 400 and "Sync input too long" in body:
-                ext = _guess_ext(filename, mime)
-                alt_codes = alternative_language_codes
-                if language_code.startswith("th") and (not alt_codes or "en-US" not in alt_codes):
-                    alt_codes = ["en-US"] + (alt_codes or [])
-                text, raw = await _stt_longrun(
-                    audio_bytes,
-                    file_ext=ext,
-                    content_type=mime,
-                    bucket_name=bucket,
-                    lang_hint=language_code,
-                    alternative_language_codes=alt_codes,
-                )
-                return text, raw
-            return f"❌ STT HTTP {resp.status_code}", {"error": body, "config": config}
-        data = resp.json()
-    except httpx.TimeoutException:
-        return "⏳ STT timeout", {}
-    except Exception as e:
-        return f"❌ STT request error: {type(e).__name__}: {e}", {}
-
-    # รวมข้อความจาก alternatives
-    results = data.get("results", []) if isinstance(data, dict) else []
-    text = " ".join(
-        alt.get("transcript", "").strip()
-        for res in results
-        for alt in (res.get("alternatives") or [])
-        if alt.get("transcript")
-    ).strip()
-
-    return text, data
-
-async def stt_transcribe_file(
-    path: str,
-    *,
-    api_key: Optional[str] = None,
+    bucket_name: Optional[str],
     lang_hint: Optional[str] = None,
-    enable_punctuation: bool = True,
-    max_alternatives: int = 1,
+    alt_langs: Optional[List[str]] = None,
+    # alias เดิม
+    alternative_language_codes: Optional[List[str]] = None,
+    poll: bool = True,
+    max_wait_sec: float = 900.0,
+    interval_sec: float = 5.0,
     diarization_speaker_count: Optional[int] = None,
-    profanity_filter: Optional[bool] = None,
-    audio_channel_count: Optional[int] = None,
-    enable_separate_recognition_per_channel: Optional[bool] = None,
     model: Optional[str] = None,
     use_enhanced: Optional[bool] = None,
-    alternative_language_codes: Optional[List[str]] = None,
-    sample_rate_hz: Optional[int] = None,            # ⭐ รองรับ parameter เดียวกัน
-    timeout_s: float = 120.0,
-    fallback_async_bucket_name: Optional[str] = None, # ⭐ auto fallback (จะอ่าน ENV ถ้าไม่ได้ส่ง)
+    audio_channel_count: Optional[int] = None,
+    enable_separate_recognition_per_channel: Optional[bool] = None,
+    profanity_filter: Optional[bool] = None,
+    speech_contexts: Optional[List[Dict[str, Any]]] = None,
 ) -> Tuple[str, Dict[str, Any]]:
-    """Wrapper อ่านไฟล์จากดิสก์แล้วเรียก stt_transcribe_bytes"""
+    if not bucket_name:
+        return "❌ Missing GCS_BUCKET_NAME", {}
+
+    # Normalize alias
+    if alternative_language_codes and not alt_langs:
+        alt_langs = alternative_language_codes
+
+    # 1) MIME
+    if not content_type:
+        content_type = _guess_mime_by_ext(file_ext or "")
+
+    # 2) Upload to GCS
+    obj_name = f"discord_uploads/{uuid.uuid4().hex}{file_ext if file_ext.startswith('.') else f'.{file_ext}'}"
     try:
-        with open(path, "rb") as f:
-            audio_bytes = f.read()
+        _ = await _gcs_simple_upload(
+            bucket=bucket_name,
+            obj_name=obj_name,
+            content=audio_bytes,
+            content_type=content_type,
+        )
+    except httpx.HTTPStatusError as e:
+        body = e.response.text[:800] if e.response is not None else ""
+        return f"❌ GCS upload failed (HTTP {e.response.status_code})", {"error": body}
     except Exception as e:
-        return f"❌ Cannot read file: {e}", {}
+        return f"❌ GCS upload error: {type(e).__name__}: {e}", {}
 
-    filename = os.path.basename(path)
-    content_type = _guess_mime_by_ext(filename, None)
+    gcs_uri = f"gs://{bucket_name}/{obj_name}"
 
-    if sample_rate_hz is None:
-        enc = _mime_to_encoding(content_type, filename)
-        if enc in ("OGG_OPUS", "WEBM_OPUS"):
-            sample_rate_hz = 48000
+    # 3) Build language & encoding
+    language_code = _norm_lang(lang_hint) or "th-TH"   # ✅ default language
+    alt_codes = [c for c in (alt_langs or []) if c] or None
+    encoding = _mime_to_encoding(content_type, file_ext)
 
-    # อ่านบัคเก็ตจาก param หรือ ENV
-    bucket = _resolve_bucket(fallback_async_bucket_name)
+    # 4) Start longrunning
+    try:
+        start = await _speech_longrunning_start(
+            gcs_uri=gcs_uri,
+            language_code=language_code,
+            alternative_language_codes=alt_codes,
+            enable_automatic_punctuation=True,
+            diarization_speaker_count=diarization_speaker_count,
+            model=model,
+            use_enhanced=use_enhanced,
+            audio_channel_count=audio_channel_count,
+            enable_separate_recognition_per_channel=enable_separate_recognition_per_channel,
+            profanity_filter=profanity_filter,
+            speech_contexts=speech_contexts,
+            encoding=encoding,  # ✅ สำคัญ
+        )
+    except Exception as e:
+        return f"❌ Speech start error: {e}", {}
 
-    return await stt_transcribe_bytes(
-        audio_bytes,
-        api_key=api_key,
-        filename=filename,
-        content_type=content_type,
-        lang_hint=lang_hint,
-        enable_punctuation=enable_punctuation,
-        max_alternatives=max_alternatives,
-        diarization_speaker_count=diarization_speaker_count,
-        profanity_filter=profanity_filter,
-        audio_channel_count=audio_channel_count,
-        enable_separate_recognition_per_channel=enable_separate_recognition_per_channel,
-        model=model,
-        use_enhanced=use_enhanced,
-        alternative_language_codes=alternative_language_codes,
-        sample_rate_hz=sample_rate_hz,
-        timeout_s=timeout_s,
-        fallback_async_bucket_name=bucket,  # 👈 ส่งต่อ (ถ้า None จะอ่านจาก ENV ในตัวฟังก์ชัน)
-    )
+    op_name = start.get("name")
+    if not op_name:
+        return "❌ Speech operation has no name", start
+
+    if not poll:
+        return "⏳ STT job started (poll disabled).", start
+
+    # 5) Poll
+    try:
+        op = await _speech_poll_operation(
+            name=op_name, max_wait_sec=max_wait_sec, interval_sec=interval_sec
+        )
+    except httpx.HTTPStatusError as e:
+        body = e.response.text[:800] if e.response is not None else ""
+        return f"❌ Speech poll failed (HTTP {e.response.status_code})", {"error": body}
+    except Exception as e:
+        return f"❌ Speech poll error: {type(e).__name__}: {e}", {}
+
+    # 6) Join transcript
+    text = _join_transcript_from_operation(op)
+    return text, op
