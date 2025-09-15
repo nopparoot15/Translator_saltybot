@@ -7,9 +7,8 @@ from stt_google_sync import stt_transcribe_bytes
 from stt_google_async import transcribe_long_audio_bytes
 
 COMPRESSED_EXTS = {".mp3", ".m4a", ".ogg", ".opus", ".webm", ".mp4"}
-OPUS_MIME = {"audio/ogg", "audio/webm"}
 
-def _guess( filename: Optional[str], content_type: Optional[str] ) -> tuple[str, str]:
+def _guess(filename: Optional[str], content_type: Optional[str]) -> tuple[str, str]:
     ext = (os.path.splitext(filename or "")[1] or "").lower()
     ctype = content_type or mimetypes.guess_type(filename or "")[0] or "application/octet-stream"
     return ext, ctype
@@ -18,7 +17,7 @@ def _need_async(ext: str, size: int) -> bool:
     # บีบอัดเกิน ~1.8MB มักยาว > 1 นาที ⇒ บังคับ async
     if ext in COMPRESSED_EXTS:
         return size > 1_800_000
-    # WAV/FLAC ไม่บีบอัด ให้เกณฑ์ ~9MB
+    # WAV/FLAC ไม่บีบอัด ใช้เกณฑ์ ~9MB
     return size > 9_000_000
 
 def _norm_lang(code: Optional[str]) -> str:
@@ -52,24 +51,28 @@ async def transcribe_auto(
 
     bucket = gcs_bucket or os.getenv("GCS_BUCKET_NAME") or os.getenv("GOOGLE_CLOUD_STORAGE_BUCKET")
 
-    # เฮอร์ริสติกเลือก async อัตโนมัติ
+    # ถ้ายาว/ใหญ่ → ใช้ long-running เลย
     if bucket and _need_async(ext, len(audio_bytes or b"")):
+        # ไทยปนอังกฤษ: เติม en-US ให้อัตโนมัติถ้ายังไม่มี
+        alt_codes = (["en-US"] + alts) if primary.startswith("th") and "en-US" not in alts else (alts or None)
         text, raw = await transcribe_long_audio_bytes(
             audio_bytes,
             file_ext=ext or ".wav",
             content_type=ctype,
             bucket_name=bucket,
             lang_hint=primary,
-            alternative_language_codes=(["en-US"] + alts) if primary.startswith("th") and "en-US" not in alts else (alts or None),
+            alternative_language_codes=alt_codes,
         )
         mode = "google async"
     else:
+        # สั้น → ลอง sync ก่อน (ตัว sync ของคุณมี auto-fallback จาก 400 อยู่แล้ว)
+        alt_codes = (["en-US"] + alts) if primary.startswith("th") and "en-US" not in (alts or []) else alts
         text, raw = await stt_transcribe_bytes(
             audio_bytes,
             filename=filename,
             content_type=ctype,
             lang_hint=primary,
-            alternative_language_codes=(["en-US"] + alts) if primary.startswith("th") and "en-US" not in (alts or []) else alts,
+            alternative_language_codes=alt_codes,
         )
         mode = "google sync"
 
