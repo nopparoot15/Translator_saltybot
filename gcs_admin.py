@@ -1,7 +1,7 @@
+# gcs_admin.py
 from __future__ import annotations
 
-import asyncio
-from typing import Optional, Tuple, List, Dict, Any
+from typing import Optional, Tuple, Dict
 from urllib.parse import quote
 
 import httpx
@@ -9,149 +9,80 @@ import google.auth
 from google.auth.transport.requests import Request
 
 API_ROOT = "https://storage.googleapis.com/storage/v1"
-USER_AGENT = "salty-translator-bot/1.0"
 
-# ------------------------------------------------------------
-# Auth helpers
-# ------------------------------------------------------------
+
 async def _get_access_token(scope: str = "https://www.googleapis.com/auth/cloud-platform") -> str:
     creds, _ = google.auth.default(scopes=[scope])
     if not creds.valid:
         creds.refresh(Request())
     return creds.token
 
-def _get_sa_email_safe() -> str:
-    try:
-        creds, _ = google.auth.default()
-        # service_account.Credentials มี property พวกนี้
-        for attr in ("service_account_email", "signer_email", "_service_account_email"):
-            v = getattr(creds, attr, None)
-            if v:
-                return str(v)
-    except Exception:
-        pass
-    return "-"
-
-# ------------------------------------------------------------
-# Low-level JSON API wrappers
-# ------------------------------------------------------------
-async def _request_json(
-    method: str,
-    url: str,
-    *,
-    params: Optional[Dict[str, Any]] = None,
-    headers: Optional[Dict[str, str]] = None,
-) -> Dict[str, Any]:
-    token = await _get_access_token()
-    h = {"Authorization": f"Bearer {token}", "User-Agent": USER_AGENT}
-    if headers:
-        h.update(headers)
-    async with httpx.AsyncClient(timeout=httpx.Timeout(60.0)) as client:
-        r = await client.request(method, url, params=params, headers=h)
-        r.raise_for_status()
-        if r.content:
-            return r.json()
-        return {}
 
 async def _list_objects(
     bucket: str,
     *,
     prefix: Optional[str] = None,
     page_token: Optional[str] = None,
-    include_versions: bool = False,
     user_project: Optional[str] = None,
-) -> Dict[str, Any]:
-    params: Dict[str, Any] = {"maxResults": 1000}
+) -> Dict:
+    token = await _get_access_token()
+    params = {"maxResults": 1000}
     if prefix:
         params["prefix"] = prefix
     if page_token:
         params["pageToken"] = page_token
-    if include_versions:
-        params["versions"] = "true"
     if user_project:
         params["userProject"] = user_project
+
     url = f"{API_ROOT}/b/{bucket}/o"
-    return await _request_json("GET", url, params=params)
+    async with httpx.AsyncClient(timeout=httpx.Timeout(60.0)) as client:
+        r = await client.get(url, headers={"Authorization": f"Bearer {token}"}, params=params)
+        r.raise_for_status()
+        return r.json()
 
-async def _delete_object(
-    bucket: str,
-    object_name: str,
-    *,
-    generation: Optional[str] = None,
-    user_project: Optional[str] = None,
-) -> None:
-    # ต้อง urlencode ชื่อ object
+
+async def _delete_object(bucket: str, object_name: str, *, user_project: Optional[str] = None) -> None:
+    token = await _get_access_token()
     url = f"{API_ROOT}/b/{bucket}/o/{quote(object_name, safe='')}"
-    params: Dict[str, Any] = {}
-    if generation:
-        params["generation"] = generation
+    params = {}
     if user_project:
         params["userProject"] = user_project
-    await _request_json("DELETE", url, params=params)
+    async with httpx.AsyncClient(timeout=httpx.Timeout(60.0)) as client:
+        r = await client.delete(url, headers={"Authorization": f"Bearer {token}"}, params=params)
+        r.raise_for_status()
 
-async def _delete_bucket(bucket: str, *, user_project: Optional[str]) -> None:
+
+async def _delete_bucket(bucket: str, *, user_project: Optional[str] = None) -> None:
+    token = await _get_access_token()
     url = f"{API_ROOT}/b/{bucket}"
-    params: Dict[str, Any] = {}
+    params = {}
     if user_project:
         params["userProject"] = user_project
-    await _request_json("DELETE", url, params=params)
+    async with httpx.AsyncClient(timeout=httpx.Timeout(60.0)) as client:
+        r = await client.delete(url, headers={"Authorization": f"Bearer {token}"}, params=params)
+        r.raise_for_status()
 
-# ------------------------------------------------------------
-# High-level ops
-# ------------------------------------------------------------
-async def gcs_delete_all_objects(
-    bucket: str,
-    *,
-    prefix: Optional[str] = None,
-    user_project: Optional[str] = None,
-    include_versions: bool = True,
-    concurrency: int = 16,
-) -> int:
-    """
-    ลบ objects ทั้งหมดในบัคเก็ต (รองรับ prefix และ versioned objects)
-    คืนจำนวนที่ลบสำเร็จ
-    """
+
+async def gcs_delete_all_objects(bucket: str, *, prefix: Optional[str] = None, user_project: Optional[str] = None) -> int:
+    """ลบ objects ทั้งหมดในบัคเก็ต (กรองด้วย prefix ได้) — คืนจำนวนที่ลบสำเร็จ"""
     deleted = 0
-    sem = asyncio.Semaphore(max(1, int(concurrency)))
-
-    async def _del(obj: Dict[str, Any]):
-        nonlocal deleted
-        name = obj.get("name", "")
-        gen = str(obj.get("generation") or "") or None
-        try:
-            async with sem:
-                await _delete_object(bucket, name, generation=gen, user_project=user_project)
-            deleted += 1
-        except httpx.HTTPStatusError:
-            # ข้ามวัตถุที่ลบไม่ได้ (เช่น สิทธิ์/ถูกลบไปก่อนแล้ว)
-            pass
-
-    page_token: Optional[str] = None
-    tasks: List[asyncio.Task] = []
-
+    page = None
     while True:
-        data = await _list_objects(
-            bucket,
-            prefix=prefix,
-            page_token=page_token,
-            include_versions=include_versions,
-            user_project=user_project,
-        )
-        items = data.get("items") or []
+        data = await _list_objects(bucket, prefix=prefix, page_token=page, user_project=user_project)
+        items = data.get("items", []) or []
         for obj in items:
-            tasks.append(asyncio.create_task(_del(obj)))
-
-        page_token = data.get("nextPageToken")
-        if not page_token:
+            try:
+                await _delete_object(bucket, obj.get("name", ""), user_project=user_project)
+                deleted += 1
+            except httpx.HTTPStatusError:
+                # ลบไม่ได้บางชิ้นก็ข้ามไป ทำต่อ
+                pass
+        page = data.get("nextPageToken")
+        if not page:
             break
-
-    if tasks:
-        await asyncio.gather(*tasks, return_exceptions=True)
     return deleted
 
-# ------------------------------------------------------------
-# Public entry
-# ------------------------------------------------------------
+
 async def gcs_delete_bucket(
     bucket: str,
     *,
@@ -160,56 +91,46 @@ async def gcs_delete_bucket(
     user_project: Optional[str] = None,
 ) -> Tuple[bool, str]:
     """
-    ลบบัคเก็ต:
-      - ถ้า force=True จะลบ objects (รวมทุกเวอร์ชัน) ก่อน (กรองด้วย prefix ถ้าระบุ)
-      - รองรับบัคเก็ตแบบ Requester Pays ผ่าน user_project
-      - ต้องมีสิทธิ์อย่างน้อย: roles/storage.admin (หรือรวม objectAdmin + buckets.delete)
+    ลบบัคเก็ต GCS
+      - ถ้า force=True จะลบ objects ทั้งหมด (หรือเฉพาะ prefix) ก่อน
+      - ถ้าบัคเก็ตเป็น requester-pays ต้องส่ง user_project (PROJECT_ID/NUMBER) มาด้วย
+      - ต้องมีสิทธิ์อย่างน้อย roles/storage.admin บนโปรเจกต์เจ้าของบัคเก็ต หรือมอบสิทธิ์ระดับบัคเก็ต
     """
-    sa_email = _get_sa_email_safe()
     try:
         n = 0
         if force:
-            n = await gcs_delete_all_objects(
-                bucket, prefix=prefix, user_project=user_project, include_versions=True
-            )
+            n = await gcs_delete_all_objects(bucket, prefix=prefix, user_project=user_project)
 
         await _delete_bucket(bucket, user_project=user_project)
-        msg = f"✅ ลบบัคเก็ต `{bucket}` สำเร็จ"
+
+        extra = []
         if force:
-            msg += f" (ลบ objects {n} ชิ้นก่อนหน้า)"
+            extra.append(f"ลบ objects {n} ชิ้นก่อนหน้า")
         if user_project:
-            msg += f"\n• userProject: `{user_project}`"
-        return True, msg
+            extra.append(f"userProject={user_project}")
+        note = f" ({', '.join(extra)})" if extra else ""
+
+        return True, f"✅ ลบบัคเก็ต `{bucket}` สำเร็จ{note}"
 
     except httpx.HTTPStatusError as e:
-        code = getattr(e.response, "status_code", None)
-        detail = ""
-        try:
-            detail = (e.response.json().get("error", {}).get("message") or "")[:300]
-        except Exception:
-            detail = (e.response.text or "")[:300]
+        status = getattr(e.response, "status_code", None)
+        body = (e.response.text or "")[:500] if getattr(e, "response", None) else ""
 
-        # Mapping ที่พบบ่อย
-        if code == 409:
-            return False, "⚠️ ลบบัคเก็ตไม่สำเร็จ: บัคเก็ตยังไม่ว่าง (ลองใช้ `--force` เพื่อลบ objects ทั้งหมดก่อน)"
-        if code == 404:
+        if status == 409:
+            return False, "⚠️ ลบบัคเก็ตไม่สำเร็จ: บัคเก็ตยังไม่ว่าง (ลองใช้ --force เพื่อลบ objects ก่อน)"
+        if status == 404:
             return False, "⚠️ ไม่พบบัคเก็ตดังกล่าว"
-        if code == 400 and ("user project" in detail.lower() or "requester pays" in detail.lower()):
+        if status == 400 and "requester pays" in body.lower():
+            return False, "⚠️ บัคเก็ตเป็น *Requester Pays* — โปรดระบุ `--user-project=<PROJECT_ID>`"
+        if status == 403:
             return False, (
-                "⚠️ บัคเก็ตนี้เป็นแบบ *Requester Pays* จำเป็นต้องระบุ `--user-project=<PROJECT_ID>`\n"
-                f"รายละเอียด: {detail or 'userProject missing'}"
-            )
-        if code == 403:
-            return False, (
-                "❌ ไม่มีสิทธิ์ลบ (403 Forbidden)\n"
-                f"• SA: `{sa_email}`\n"
-                f"• userProject: `{user_project or '-'}`\n"
-                "จำเป็นต้องมีบทบาทอย่างน้อย `roles/storage.admin` บนโปรเจกต์ของบัคเก็ต หรือบนตัวบัคเก็ต"
+                "❌ ไม่มีสิทธิ์ (403 Forbidden)\n"
+                "- ต้องมีสิทธิ์อย่างน้อย `roles/storage.admin` บนโปรเจกต์เจ้าของบัคเก็ต "
+                "หรือมอบสิทธิ์ระดับบัคเก็ตให้ service account/user ของคุณ\n"
+                "- ถ้าเป็น *Requester Pays* ให้ใส่ `--user-project=<PROJECT_ID>` ด้วย"
             )
 
-        return False, f"❌ ล้มเหลว (HTTP {code}) {detail or str(e)[:200]}"
+        return False, f"❌ ล้มเหลว (HTTP {status or '??'}) {body or str(e)[:200]}"
 
     except Exception as e:
         return False, f"❌ Error: {type(e).__name__}: {e}"
-
-__all__ = ["gcs_delete_bucket", "gcs_delete_all_objects"]
