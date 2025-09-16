@@ -1,10 +1,12 @@
 # stt_google_async.py
 # ------------------------------------------------------------
-# Google Speech-to-Text (Long Running) for LONG audio (e.g. 10+ minutes)
+# Google Speech-to-Text (Long Running) for LONG audio (e.g. 1+ minute)
 # Flow:
 #   1) Upload bytes -> GCS object (using service account access token)
 #   2) Call speech:longrunningrecognize with gs:// URI (OAuth Bearer)
 #   3) Poll operation until done, return (transcript, raw_json)
+#   4) (ออปชัน) ตั้งคิวลบไฟล์ GCS อัตโนมัติหลังเสร็จงาน
+#      - กำหนดผ่านพารามิเตอร์ delete_after_seconds หรือ ENV: GCS_DELETE_DELAY_SECONDS
 # ------------------------------------------------------------
 
 from __future__ import annotations
@@ -13,6 +15,7 @@ import os
 import uuid
 import asyncio
 from typing import Optional, Tuple, Dict, Any, List
+from urllib.parse import quote
 
 import httpx
 import google.auth
@@ -88,7 +91,7 @@ async def _get_access_token(scope: str = "https://www.googleapis.com/auth/cloud-
         creds.refresh(request)
     return creds.token
 
-# ---------- GCS Upload ----------
+# ---------- GCS Upload/Delete ----------
 
 async def _gcs_simple_upload(
     *,
@@ -113,6 +116,23 @@ async def _gcs_simple_upload(
         r.raise_for_status()
         return r.json()
 
+async def _gcs_delete_object(bucket: str, object_name: str) -> None:
+    """ลบ object เดี่ยวใน GCS"""
+    token = await _get_access_token("https://www.googleapis.com/auth/cloud-platform")
+    url = f"https://storage.googleapis.com/storage/v1/b/{bucket}/o/{quote(object_name, safe='')}"
+    async with httpx.AsyncClient(timeout=httpx.Timeout(30.0)) as client:
+        r = await client.delete(url, headers={"Authorization": f"Bearer {token}"})
+        r.raise_for_status()
+
+async def _delete_after_delay(bucket: str, object_name: str, delay_s: int) -> None:
+    """ตั้งคิวลบไฟล์หลังดีเลย์ (ไม่ให้ล้มงานหลักถ้าลบไม่สำเร็จ)"""
+    try:
+        await asyncio.sleep(max(0, int(delay_s)))
+        await _gcs_delete_object(bucket, object_name)
+    except Exception:
+        # เงียบ ๆ
+        pass
+
 # ---------- Speech Longrunning ----------
 
 async def _speech_longrunning_start(
@@ -129,14 +149,14 @@ async def _speech_longrunning_start(
     profanity_filter: Optional[bool] = None,
     speech_contexts: Optional[List[Dict[str, Any]]] = None,
     encoding: str = "ENCODING_UNSPECIFIED",
-) -> Dict[str, Any]:
+) -> Dict[str, Any]]:
     token = await _get_access_token("https://www.googleapis.com/auth/cloud-platform")
     url = "https://speech.googleapis.com/v1/speech:longrunningrecognize"
 
     config: Dict[str, Any] = {
-        "languageCode": language_code,                         # ✅ require
+        "languageCode": language_code,
         "enableAutomaticPunctuation": bool(enable_automatic_punctuation),
-        "encoding": encoding,                                   # ✅ ใส่ให้ชัด
+        "encoding": encoding,
     }
     if alternative_language_codes:
         config["alternativeLanguageCodes"] = alternative_language_codes
@@ -177,7 +197,7 @@ async def _speech_poll_operation(
     name: str,
     max_wait_sec: float = 900.0,
     interval_sec: float = 5.0
-) -> Dict[str, Any]:
+) -> Dict[str, Any]]:
     token = await _get_access_token("https://www.googleapis.com/auth/cloud-platform")
     url = f"https://speech.googleapis.com/v1/operations/{name}"
     headers = {"Authorization": f"Bearer {token}"}
@@ -234,7 +254,9 @@ async def transcribe_long_audio_bytes(
     enable_separate_recognition_per_channel: Optional[bool] = None,
     profanity_filter: Optional[bool] = None,
     speech_contexts: Optional[List[Dict[str, Any]]] = None,
-) -> Tuple[str, Dict[str, Any]]:
+    # ใหม่: ตั้งคิวลบ object หลังเสร็จงาน (วินาที). ถ้า None จะอ่าน ENV GCS_DELETE_DELAY_SECONDS; ถ้า 0 จะไม่ลบ
+    delete_after_seconds: Optional[int] = None,
+) -> Tuple[str, Dict[str, Any]]]:
     if not bucket_name:
         return "❌ Missing GCS_BUCKET_NAME", {}
 
@@ -292,6 +314,7 @@ async def transcribe_long_audio_bytes(
         return "❌ Speech operation has no name", start
 
     if not poll:
+        # ไม่ลบในโหมดไม่ poll (กันลบก่อนงานเสร็จ)
         return "⏳ STT job started (poll disabled).", start
 
     # 5) Poll
@@ -307,4 +330,15 @@ async def transcribe_long_audio_bytes(
 
     # 6) Join transcript
     text = _join_transcript_from_operation(op)
+
+    # 7) Schedule delete (optional)
+    try:
+        env_delay = int(os.getenv("GCS_DELETE_DELAY_SECONDS", "0") or "0")
+        delay = delete_after_seconds if delete_after_seconds is not None else env_delay
+        if delay and delay > 0:
+            asyncio.create_task(_delete_after_delay(bucket_name, obj_name, int(delay)))
+    except Exception:
+        # อย่าทำให้หลักล้ม
+        pass
+
     return text, op
