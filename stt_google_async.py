@@ -1,12 +1,11 @@
 # stt_google_async.py
 # ------------------------------------------------------------
-# Google Speech-to-Text (Long Running) for LONG audio (e.g. 1+ minute)
+# Google Speech-to-Text (Long Running) for LONG audio (e.g. 10+ minutes)
 # Flow:
 #   1) Upload bytes -> GCS object (using service account access token)
 #   2) Call speech:longrunningrecognize with gs:// URI (OAuth Bearer)
 #   3) Poll operation until done, return (transcript, raw_json)
-#   4) (ออปชัน) ตั้งคิวลบไฟล์ GCS อัตโนมัติหลังเสร็จงาน
-#      - กำหนดผ่านพารามิเตอร์ delete_after_seconds หรือ ENV: GCS_DELETE_DELAY_SECONDS
+#   4) (optional) delete GCS object immediately or after a delay
 # ------------------------------------------------------------
 
 from __future__ import annotations
@@ -14,12 +13,15 @@ from __future__ import annotations
 import os
 import uuid
 import asyncio
-from typing import Optional, Tuple, Dict, Any, List
+import logging
 from urllib.parse import quote
+from typing import Optional, Tuple, Dict, Any, List
 
 import httpx
 import google.auth
 from google.auth.transport.requests import Request
+
+logger = logging.getLogger(__name__)
 
 # ---------- Helpers ----------
 
@@ -116,22 +118,22 @@ async def _gcs_simple_upload(
         r.raise_for_status()
         return r.json()
 
-async def _gcs_delete_object(bucket: str, object_name: str) -> None:
-    """ลบ object เดี่ยวใน GCS"""
-    token = await _get_access_token("https://www.googleapis.com/auth/cloud-platform")
-    url = f"https://storage.googleapis.com/storage/v1/b/{bucket}/o/{quote(object_name, safe='')}"
+async def _gcs_delete_object(bucket: str, obj_name: str) -> None:
+    """ลบ object ออกจากบัคเก็ตทันที"""
+    token = await _get_access_token("https://www.googleapis.com/auth/devstorage.read_write")
+    url = f"https://storage.googleapis.com/storage/v1/b/{bucket}/o/{quote(obj_name, safe='')}"
     async with httpx.AsyncClient(timeout=httpx.Timeout(30.0)) as client:
         r = await client.delete(url, headers={"Authorization": f"Bearer {token}"})
         r.raise_for_status()
 
-async def _delete_after_delay(bucket: str, object_name: str, delay_s: int) -> None:
-    """ตั้งคิวลบไฟล์หลังดีเลย์ (ไม่ให้ล้มงานหลักถ้าลบไม่สำเร็จ)"""
+async def _delete_later(bucket: str, obj_name: str, delay_s: int) -> None:
+    """หน่วงเวลาลบ object (best-effort; ถ้าโปรเซสดับก่อนถึงเวลา งานนี้จะไม่รัน)"""
     try:
         await asyncio.sleep(max(0, int(delay_s)))
-        await _gcs_delete_object(bucket, object_name)
-    except Exception:
-        # เงียบ ๆ
-        pass
+        await _gcs_delete_object(bucket, obj_name)
+        logger.info(f"🗑️ Deleted GCS object gs://{bucket}/{obj_name}")
+    except Exception as e:
+        logger.warning(f"⚠️ Failed to delete gs://{bucket}/{obj_name}: {type(e).__name__}: {e}")
 
 # ---------- Speech Longrunning ----------
 
@@ -149,14 +151,14 @@ async def _speech_longrunning_start(
     profanity_filter: Optional[bool] = None,
     speech_contexts: Optional[List[Dict[str, Any]]] = None,
     encoding: str = "ENCODING_UNSPECIFIED",
-) -> Dict[str, Any]]:
+) -> Dict[str, Any]:
     token = await _get_access_token("https://www.googleapis.com/auth/cloud-platform")
     url = "https://speech.googleapis.com/v1/speech:longrunningrecognize"
 
     config: Dict[str, Any] = {
-        "languageCode": language_code,
+        "languageCode": language_code,                         # ✅ require
         "enableAutomaticPunctuation": bool(enable_automatic_punctuation),
-        "encoding": encoding,
+        "encoding": encoding,                                   # ✅ ใส่ให้ชัด
     }
     if alternative_language_codes:
         config["alternativeLanguageCodes"] = alternative_language_codes
@@ -197,7 +199,7 @@ async def _speech_poll_operation(
     name: str,
     max_wait_sec: float = 900.0,
     interval_sec: float = 5.0
-) -> Dict[str, Any]]:
+) -> Dict[str, Any]:
     token = await _get_access_token("https://www.googleapis.com/auth/cloud-platform")
     url = f"https://speech.googleapis.com/v1/operations/{name}"
     headers = {"Authorization": f"Bearer {token}"}
@@ -254,11 +256,22 @@ async def transcribe_long_audio_bytes(
     enable_separate_recognition_per_channel: Optional[bool] = None,
     profanity_filter: Optional[bool] = None,
     speech_contexts: Optional[List[Dict[str, Any]]] = None,
-    # ใหม่: ตั้งคิวลบ object หลังเสร็จงาน (วินาที). ถ้า None จะอ่าน ENV GCS_DELETE_DELAY_SECONDS; ถ้า 0 จะไม่ลบ
-    delete_after_seconds: Optional[int] = None,
-) -> Tuple[str, Dict[str, Any]]]:
+    # 🔥 การลบไฟล์ใน GCS
+    delete_after_seconds: Optional[int] = None,   # >0 = ลบแบบตั้งเวลา, None = อ่านจาก ENV, 0/None + immediate=False = ไม่ลบ
+    delete_immediately: Optional[bool] = None,    # True = ลบทันทีหลังถอดเสร็จ (เฉพาะ poll=True)
+) -> Tuple[str, Dict[str, Any]]:
     if not bucket_name:
         return "❌ Missing GCS_BUCKET_NAME", {}
+
+    # อ่านนโยบายลบจาก ENV หาก caller ไม่ได้ส่ง
+    if delete_immediately is None:
+        delete_immediately = os.getenv("GCS_DELETE_IMMEDIATELY", "0").strip().lower() in {"1", "true", "yes", "on"}
+
+    if delete_after_seconds is None:
+        try:
+            delete_after_seconds = int(os.getenv("GCS_DELETE_DELAY_SECONDS", "0"))
+        except Exception:
+            delete_after_seconds = 0
 
     # Normalize alias
     if alternative_language_codes and not alt_langs:
@@ -307,14 +320,30 @@ async def transcribe_long_audio_bytes(
             encoding=encoding,  # ✅ สำคัญ
         )
     except Exception as e:
+        # พยายามลบไฟล์ทิ้งเลยถ้าตั้ง immediate
+        try:
+            if delete_immediately:
+                await _gcs_delete_object(bucket_name, obj_name)
+        except Exception:
+            pass
         return f"❌ Speech start error: {e}", {}
 
     op_name = start.get("name")
     if not op_name:
+        # ลบทิ้งตามนโยบาย
+        try:
+            if delete_immediately:
+                await _gcs_delete_object(bucket_name, obj_name)
+            elif (delete_after_seconds or 0) > 0:
+                asyncio.create_task(_delete_later(bucket_name, obj_name, int(delete_after_seconds)))
+        except Exception:
+            pass
         return "❌ Speech operation has no name", start
 
     if not poll:
-        # ไม่ลบในโหมดไม่ poll (กันลบก่อนงานเสร็จ)
+        # ถ้า poll=False ห้ามลบทันที (ยังประมวลผลไม่เสร็จ)
+        if (delete_after_seconds or 0) > 0:
+            asyncio.create_task(_delete_later(bucket_name, obj_name, int(delete_after_seconds)))
         return "⏳ STT job started (poll disabled).", start
 
     # 5) Poll
@@ -324,21 +353,35 @@ async def transcribe_long_audio_bytes(
         )
     except httpx.HTTPStatusError as e:
         body = e.response.text[:800] if e.response is not None else ""
+        # ลบทิ้งตามนโยบาย
+        try:
+            if delete_immediately:
+                await _gcs_delete_object(bucket_name, obj_name)
+            elif (delete_after_seconds or 0) > 0:
+                asyncio.create_task(_delete_later(bucket_name, obj_name, int(delete_after_seconds)))
+        except Exception:
+            pass
         return f"❌ Speech poll failed (HTTP {e.response.status_code})", {"error": body}
     except Exception as e:
+        try:
+            if delete_immediately:
+                await _gcs_delete_object(bucket_name, obj_name)
+            elif (delete_after_seconds or 0) > 0:
+                asyncio.create_task(_delete_later(bucket_name, obj_name, int(delete_after_seconds)))
+        except Exception:
+            pass
         return f"❌ Speech poll error: {type(e).__name__}: {e}", {}
 
     # 6) Join transcript
     text = _join_transcript_from_operation(op)
 
-    # 7) Schedule delete (optional)
+    # 7) Delete per policy
     try:
-        env_delay = int(os.getenv("GCS_DELETE_DELAY_SECONDS", "0") or "0")
-        delay = delete_after_seconds if delete_after_seconds is not None else env_delay
-        if delay and delay > 0:
-            asyncio.create_task(_delete_after_delay(bucket_name, obj_name, int(delay)))
-    except Exception:
-        # อย่าทำให้หลักล้ม
-        pass
+        if delete_immediately and poll:
+            await _gcs_delete_object(bucket_name, obj_name)
+        elif (delete_after_seconds or 0) > 0:
+            asyncio.create_task(_delete_later(bucket_name, obj_name, int(delete_after_seconds)))
+    except Exception as e:
+        logger.warning(f"⚠️ cleanup failed for gs://{bucket_name}/{obj_name}: {e}")
 
     return text, op
