@@ -115,6 +115,7 @@ async def _gcs_delete_object(bucket: str, obj_name: str) -> None:
     async with httpx.AsyncClient(timeout=httpx.Timeout(30.0)) as client:
         r = await client.delete(url, headers={"Authorization": f"Bearer {token}"})
         r.raise_for_status()
+    logger.info(f"🗑️ Deleted GCS object gs://{bucket}/{obj_name} (HTTP {r.status_code})")
 
 async def _delete_later(bucket: str, obj_name: str, delay_s: int) -> None:
     """หน่วงเวลาลบ object (best-effort; ถ้าโปรเซสดับก่อนถึงเวลา งานนี้จะไม่รัน)"""
