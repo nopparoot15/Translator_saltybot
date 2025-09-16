@@ -1,13 +1,3 @@
-# stt_google_async.py
-# ------------------------------------------------------------
-# Google Speech-to-Text (Long Running) for LONG audio (e.g. 10+ minutes)
-# Flow:
-#   1) Upload bytes -> GCS object (using service account access token)
-#   2) Call speech:longrunningrecognize with gs:// URI (OAuth Bearer)
-#   3) Poll operation until done, return (transcript, raw_json)
-#   4) (optional) delete GCS object immediately or after a delay
-# ------------------------------------------------------------
-
 from __future__ import annotations
 
 import os
