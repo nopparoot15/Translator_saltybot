@@ -1,3 +1,4 @@
+# translation_service.py
 import re
 import html
 import httpx
@@ -36,6 +37,22 @@ def engine_label_for_message(message) -> str:
         "gpt": "GPT-4o mini",
     }
     return mapping.get(provider, provider or "unknown")
+
+# ---------------- Helpers ----------------
+
+def _coverage_ratio(src: str, out: str) -> float:
+    s = re.sub(r"\W+", "", src or "")
+    o = re.sub(r"\W+", "", out or "")
+    if len(s) < 20:
+        return 1.0
+    return (len(o) / max(1, len(s)))
+
+def _line_mismatch(src: str, out: str) -> bool:
+    s_lines = [l for l in (src or "").splitlines() if l.strip()]
+    o_lines = [l for l in (out or "").splitlines() if l.strip()]
+    return len(o_lines) + 1 < len(s_lines)
+
+_SPEAKER_RE = re.compile(r"^\s*([A-Za-z0-9_@.\-]{1,24}):\s*(.*)$")
 
 # ---- Google Translate ----
 def chunk_text(text: str, max_len: int = 4500) -> list[str]:
@@ -191,16 +208,46 @@ async def translate_with_provider(
             filtered = lang_ok
         return "\n".join(filtered).strip()
 
+    async def _call_model(text: str, model: str, tgt_name: str) -> str:
+        # พรอมป์สั้นเพื่อความเร็วและประหยัด
+        prompt = (
+            f"Translate into {tgt_name}.\n"
+            "Output ONLY the translation wrapped in <T>...</T>.\n\n"
+            f"Text:\n{text}"
+        )
+        raw = await get_translation(prompt, model)
+        return raw
+
+    async def _translate_line_by_line(text: str, model: str, tgt_name: str, tgt_code: str) -> str:
+        outs = []
+        for ln in (text or "").splitlines():
+            if not ln.strip():
+                outs.append("")
+                continue
+            # รองรับ speaker tag "xxx: ..."
+            tag = ""
+            m = _SPEAKER_RE.match(ln)
+            body = ln
+            if m:
+                tag = m.group(1) + ": "
+                body = m.group(2)
+
+            raw = await _call_model(body, model, tgt_name)
+            out = _final_clean(body, raw, tgt_code)
+            if tag:
+                out = tag + out
+            outs.append(out)
+        return "\n".join(outs).strip()
+
     guild_id = getattr(getattr(message, "guild", None), "id", 0)
     provider = get_translator_engine(guild_id)
 
     # Google path (with global quota)
     async def _google_translate_and_clean() -> str:
-        n_chars = len(src_text)
         today = datetime.now().strftime("%Y-%m-%d")
         ok, reason = await check_and_increment_gtranslate_quota(
-            n_chars=len(text),
-            date_str=today_str,
+            n_chars=len(src_text or ""),
+            date_str=today,
             daily_limit=GOOGLE_TRANSLATE_DAILY_LIMIT,
             user_id=message.author.id,
         )
@@ -218,23 +265,16 @@ async def translate_with_provider(
 
     model = "gpt-5-nano" if provider == "gpt5nano" else "gpt-4o-mini"
     tgt_name = target_lang_name
-    src_key = (source_code or "").split("-")[0] if source_code else None
-    src_name = LANG_NAMES.get(src_key, "auto-detected") if source_code else "auto-detected"
-    direction = f"from {src_name} to {tgt_name}" if source_code else f"into {tgt_name}"
 
-    prompt = (
-        f"Translate the following text {direction}.\n"
-        "- Make it natural and idiomatic (spoken style if casual, formal if formal).\n"
-        "- Output ONLY the translation wrapped in <T>...</T>.\n\n"
-        f"Text:\n{src_text}"
-    )
-
-    raw = await get_translation(prompt, model)
+    # รอบแรก: แปลทั้งก้อน
+    raw = await _call_model(src_text, model, tgt_name)
     out = _final_clean(src_text, raw, target_code)
-    if not out:
-        retry_prompt = f"Translate into {tgt_name}.\nOutput ONLY the translation wrapped in <T>...</T>.\n\nText:\n{src_text}"
-        raw2 = await get_translation(retry_prompt, model)
-        out = _final_clean(src_text, raw2, target_code)
+
+    # ถ้าขาด/สั้น/บรรทัดไม่ครบ → รีทรายแบบบรรทัดต่อบรรทัด
+    if (not out) or _coverage_ratio(src_text, out) < 0.5 or _line_mismatch(src_text, out):
+        out2 = await _translate_line_by_line(src_text, model, tgt_name, target_code)
+        if out2:
+            out = out2
 
     if not out:
         return await _google_translate_and_clean()
