@@ -319,10 +319,7 @@ def register_commands(bot: commands.Bot):
 
     # ---------- GCS Admin (Danger Zone) ----------
     def _gcs_admin_allow(ctx: commands.Context) -> bool:
-        """อนุญาตใช้คำสั่ง GCS เฉพาะผู้มีสิทธิ์เท่านั้น
-        - ถ้าเซ็ต ENV GCS_ADMIN_ALLOWLIST = "123,456" จะยอมเฉพาะ ID เหล่านั้น
-        - ถ้าไม่เซ็ต ENV จะยอม admin/manage_guild ในเซิร์ฟเวอร์
-        """
+        """อนุญาตใช้คำสั่ง GCS สำหรับผู้มีสิทธิ์เท่านั้น"""
         allow_env = os.getenv("GCS_ADMIN_ALLOWLIST", "").replace(" ", "")
         if allow_env:
             allowed = {int(x) for x in allow_env.split(",") if x.isdigit()}
@@ -335,56 +332,43 @@ def register_commands(bot: commands.Bot):
         help="ลบบัคเก็ต GCS (อันตราย!) ใช้: !gcsdelbucket <bucket> [--force] [--prefix=<pref>] [--user-project=<PROJECT_ID>]"
     )
     async def gcsdelbucket(ctx: commands.Context, *, args: str):
-        # สิทธิ์
+        # ตรวจสิทธิ์
         if not _gcs_admin_allow(ctx):
             return await ctx.reply("❌ คุณไม่มีสิทธิ์ใช้คำสั่งนี้", mention_author=False)
     
         # แยก args
         try:
-            parts = shlex.split(args or "")
+            parts = shlex.split(args)
         except ValueError:
-            return await ctx.reply("รูปแบบอาร์กิวเมนต์ไม่ถูกต้อง", mention_author=False)
+            return await ctx.reply("รูปแบบไม่ถูกต้อง", mention_author=False)
     
         if not parts:
-            return await ctx.reply(
-                "ระบุชื่อบัคเก็ตด้วย เช่น `!gcsdelbucket my-bucket --force --user-project=<PROJECT_ID>`",
-                mention_author=False
-            )
+            return await ctx.reply("ระบุชื่อบัคเก็ตด้วย เช่น `!gcsdelbucket my-bucket --force`", mention_author=False)
     
         bucket = parts[0]
-        force = False
+        force = any(p == "--force" for p in parts[1:])
+    
         prefix = None
         user_project = None
         for p in parts[1:]:
-            if p == "--force":
-                force = True
-            elif p.startswith("--prefix="):
+            if p.startswith("--prefix="):
                 prefix = p.split("=", 1)[1] or None
             elif p.startswith("--user-project="):
                 user_project = p.split("=", 1)[1] or None
     
-        # ค่าเริ่มต้นของ userProject (สำหรับบัคเก็ตที่เปิด Requester Pays)
-        if not user_project:
-            user_project = (
-                os.getenv("GCS_BILLING_PROJECT")
-                or os.getenv("GOOGLE_CLOUD_PROJECT")
-                or os.getenv("GCP_PROJECT")
-                or None
-            )
-    
         # แจ้งเตือนความเสี่ยง
-        warn = f"⚠️ จะลบบัคเก็ต `{bucket}`"
+        warn_bits = [f"จะลบบัคเก็ต `{bucket}`"]
         if force and prefix:
-            warn += f" (จะลบ objects ที่ prefix `{prefix}` ก่อน)"
+            warn_bits.append(f"(ลบ objects ที่ prefix `{prefix}` ก่อน)")
         elif force:
-            warn += " (จะลบ objects **ทั้งหมด** ก่อน)"
+            warn_bits.append("(ลบ objects ทั้งหมดก่อน)")
         else:
-            warn += " โดย **จะไม่ลบ** objects ภายใน"
+            warn_bits.append("(จะไม่ลบ objects ภายในก่อน)")
         if user_project:
-            warn += f"\n• userProject: `{user_project}`"
-        await ctx.send(warn, delete_after=10)
+            warn_bits.append(f"userProject=`{user_project}`")
     
-        # ดำเนินการ
+        await ctx.send("⚠️ " + " ".join(warn_bits) + " — ดำเนินการต่อหรือไม่?", delete_after=10)
+    
         msg = await ctx.reply("⏳ กำลังดำเนินการ…", mention_author=False)
         ok, text = await gcs_delete_bucket(bucket, force=force, prefix=prefix, user_project=user_project)
         await msg.edit(content=text)
