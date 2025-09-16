@@ -1,3 +1,5 @@
+import os
+import shlex
 import discord
 from discord.ext import commands
 from datetime import datetime, timedelta
@@ -14,6 +16,7 @@ from app_redis import (
 from tts_service import user_tts_engine, server_tts_engine, get_tts_engine
 from translation_service import translator_server_engine, get_translator_engine
 from config import STT_DAILY_LIMIT_SECONDS, TZ, STT_QUOTA_SCOPE, REDIS_URL
+from gcs_admin import gcs_delete_bucket  # ⬅️ เพิ่ม import คำสั่งลบบัคเก็ต
 
 def register_commands(bot: commands.Bot):
 
@@ -65,6 +68,11 @@ def register_commands(bot: commands.Bot):
         )
         embed.add_field(name="📸 OCR", value="`!ocr quota` — เช็คโควต้า OCR รายวัน", inline=False)
         embed.add_field(name="🌐 Google Translate", value="`!gtrans` — เช็คโควต้า Google Translate ทั้งบอท", inline=False)
+        embed.add_field(
+            name="☁️ GCS (ผู้ดูแลระบบ)",
+            value="`!gcsdelbucket <bucket> [--force] [--prefix=<pref>]` — ลบบัคเก็ต (อันตราย!)",
+            inline=False
+        )
         embed.set_footer(text="พิมพ์ !commands เพื่อเรียกดูรายการนี้ได้ตลอดเวลา")
         await ctx.send(embed=embed, delete_after=30)
 
@@ -96,18 +104,18 @@ def register_commands(bot: commands.Bot):
         guild_id = ctx.guild.id if ctx.guild else None
         user_id = ctx.author.id
         is_exempt = user_id in EXEMPT_USER_IDS
-    
+
         # helper ภายในไฟล์
         def _seconds_until_local_midnight(tz):
             now = datetime.now(tz)
             nxt = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
             return max(0, int((nxt - now).total_seconds()))
-    
+
         def _fmt_hms(sec: int) -> str:
             h, rem = divmod(sec, 3600)
             m, s = divmod(rem, 60)
             return f"{h}ชม {m}น {s}วิ" if h else (f"{m}น {s}วิ" if m else f"{s}วิ")
-    
+
         # 1) ถ้าไม่ใช่ผู้ใช้ที่ยกเว้น → ensure Redis + อ่านโควต้า
         if not is_exempt:
             try:
@@ -122,7 +130,7 @@ def register_commands(bot: commands.Bot):
                     delete_after=12
                 )
                 return
-    
+
         # 2) คำนวณตัวเลข used / remain
         try:
             if is_exempt:
@@ -131,14 +139,14 @@ def register_commands(bot: commands.Bot):
             else:
                 used = int(await stt_get_used(user_id, guild_id, TZ) or 0)
                 remain = max(0, STT_DAILY_LIMIT_SECONDS - used)
-    
+
             # สร้าง embed
             title = "🎙️ STT Quota วันนี้"
             if (STT_QUOTA_SCOPE or "user").lower() == "global":
                 title += " (ทั้งบอท)"
             if is_exempt:
                 title += " • ยกเว้นโควต้า"
-    
+
             reset_in = _seconds_until_local_midnight(TZ)
             embed = discord.Embed(title=title, color=discord.Color.teal())
             embed.add_field(name="ใช้ไปแล้ว", value=f"{used} วินาที", inline=True)
@@ -148,14 +156,13 @@ def register_commands(bot: commands.Bot):
             if is_exempt:
                 footer += " • คุณได้รับการยกเว้นโควต้า"
             embed.set_footer(text=footer)
-    
+
             await ctx.send(embed=embed, delete_after=15)
         except Exception as e:
             await ctx.send(
                 f"❌ ไม่สามารถตรวจสอบโควต้า STT ได้ในขณะนี้\n`{type(e).__name__}: {e}`",
                 delete_after=12
             )
-
 
     # ---------- TTS ----------
     @bot.command(name="tts")
@@ -309,3 +316,49 @@ def register_commands(bot: commands.Bot):
         embed.add_field(name="ตั้งค่าไว้ (เซิร์ฟเวอร์)", value=f"`{server_engine}`", inline=True)
         embed.add_field(name="ใช้งานจริงตอนนี้", value=f"`{effective}`", inline=True)
         await ctx.send(embed=embed, delete_after=10)
+
+    # ---------- GCS Admin (Danger Zone) ----------
+    def _gcs_admin_allow(ctx: commands.Context) -> bool:
+        """อนุญาตใช้คำสั่ง GCS สำหรับผู้มีสิทธิ์เท่านั้น"""
+        allow_env = os.getenv("GCS_ADMIN_ALLOWLIST", "").replace(" ", "")
+        if allow_env:
+            allowed = {int(x) for x in allow_env.split(",") if x.isdigit()}
+            return ctx.author.id in allowed
+        perms = getattr(ctx.author, "guild_permissions", None)
+        return bool(perms and (perms.administrator or perms.manage_guild))
+
+    @bot.command(name="gcsdelbucket", help="ลบบัคเก็ต GCS (อันตราย!) ใช้: !gcsdelbucket <bucket> [--force] [--prefix=<pref>]")
+    async def gcsdelbucket(ctx: commands.Context, *, args: str):
+        # สิทธิ์
+        if not _gcs_admin_allow(ctx):
+            return await ctx.reply("❌ คุณไม่มีสิทธิ์ใช้คำสั่งนี้", mention_author=False)
+
+        # แยก args
+        try:
+            parts = shlex.split(args)
+        except ValueError:
+            return await ctx.reply("รูปแบบไม่ถูกต้อง", mention_author=False)
+
+        if not parts:
+            return await ctx.reply("ระบุชื่อบัคเก็ตด้วย เช่น `!gcsdelbucket my-bucket --force`", mention_author=False)
+
+        bucket = parts[0]
+        force = any(p == "--force" for p in parts[1:])
+        prefix = None
+        for p in parts[1:]:
+            if p.startswith("--prefix="):
+                prefix = p.split("=", 1)[1] or None
+
+        # แจ้งเตือนความเสี่ยง
+        warn = (
+            f"จะลบบัคเก็ต `{bucket}`"
+            + (" (ลบ objects ที่ prefix นี้ก่อน: `{}`)".format(prefix) if (force and prefix) else "")
+            + (" โดยจะลบ objects ทั้งหมดก่อน" if force and not prefix else "")
+            + (" โดยไม่ลบ objects ภายใน" if not force else "")
+            + " — ดำเนินการต่อหรือไม่?"
+        )
+        await ctx.send(f"⚠️ {warn}", delete_after=10)
+
+        msg = await ctx.reply("⏳ กำลังดำเนินการ…", mention_author=False)
+        ok, text = await gcs_delete_bucket(bucket, force=force, prefix=prefix)
+        await msg.edit(content=text)
