@@ -16,7 +16,7 @@ from app_redis import (
 from tts_service import user_tts_engine, server_tts_engine, get_tts_engine
 from translation_service import translator_server_engine, get_translator_engine
 from config import STT_DAILY_LIMIT_SECONDS, TZ, STT_QUOTA_SCOPE, REDIS_URL
-from gcs_admin import gcs_delete_bucket  # ⬅️ เพิ่ม import คำสั่งลบบัคเก็ต
+from gcs_admin import gcs_delete_bucket, gcs_delete_all_objects  # ⬅️ นำเข้าเพิ่ม
 
 def register_commands(bot: commands.Bot):
 
@@ -70,7 +70,10 @@ def register_commands(bot: commands.Bot):
         embed.add_field(name="🌐 Google Translate", value="`!gtrans` — เช็คโควต้า Google Translate ทั้งบอท", inline=False)
         embed.add_field(
             name="☁️ GCS (ผู้ดูแลระบบ)",
-            value="`!gcsdelbucket <bucket> [--force] [--prefix=<pref>]` — ลบบัคเก็ต (อันตราย!)",
+            value=(
+                "`!gcsclear <bucket> [--prefix=<pref>]` — ลบ **objects ทั้งหมด** (หรือเฉพาะ prefix)\n"
+                "`!gcsdelbucket <bucket> [--force] [--prefix=<pref>]` — ลบบัคเก็ต (อันตรายมาก)"
+            ),
             inline=False
         )
         embed.set_footer(text="พิมพ์ !commands เพื่อเรียกดูรายการนี้ได้ตลอดเวลา")
@@ -105,7 +108,6 @@ def register_commands(bot: commands.Bot):
         user_id = ctx.author.id
         is_exempt = user_id in EXEMPT_USER_IDS
 
-        # helper ภายในไฟล์
         def _seconds_until_local_midnight(tz):
             now = datetime.now(tz)
             nxt = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
@@ -116,13 +118,12 @@ def register_commands(bot: commands.Bot):
             m, s = divmod(rem, 60)
             return f"{h}ชม {m}น {s}วิ" if h else (f"{m}น {s}วิ" if m else f"{s}วิ")
 
-        # 1) ถ้าไม่ใช่ผู้ใช้ที่ยกเว้น → ensure Redis + อ่านโควต้า
         if not is_exempt:
             try:
                 try:
-                    get_redis_client()  # จะ throw ถ้ายังไม่ init
+                    get_redis_client()
                 except RuntimeError:
-                    await init_redis(REDIS_URL)  # init ตรงนี้ให้เลย
+                    await init_redis(REDIS_URL)
             except Exception as e:
                 await ctx.send(
                     "❌ ไม่สามารถเชื่อมต่อ Redis ได้ จึงเช็คโควต้า STT ไม่ได้ในขณะนี้\n"
@@ -131,7 +132,6 @@ def register_commands(bot: commands.Bot):
                 )
                 return
 
-        # 2) คำนวณตัวเลข used / remain
         try:
             if is_exempt:
                 used = 0
@@ -140,7 +140,6 @@ def register_commands(bot: commands.Bot):
                 used = int(await stt_get_used(user_id, guild_id, TZ) or 0)
                 remain = max(0, STT_DAILY_LIMIT_SECONDS - used)
 
-            # สร้าง embed
             title = "🎙️ STT Quota วันนี้"
             if (STT_QUOTA_SCOPE or "user").lower() == "global":
                 title += " (ทั้งบอท)"
@@ -327,48 +326,67 @@ def register_commands(bot: commands.Bot):
         perms = getattr(ctx.author, "guild_permissions", None)
         return bool(perms and (perms.administrator or perms.manage_guild))
 
-    @bot.command(
-        name="gcsdelbucket",
-        help="ลบบัคเก็ต GCS (อันตราย!) ใช้: !gcsdelbucket <bucket> [--force] [--prefix=<pref>] [--user-project=<PROJECT_ID>]"
-    )
-    async def gcsdelbucket(ctx: commands.Context, *, args: str):
-        # ตรวจสิทธิ์
+    @bot.command(name="gcsclear", help="ลบ objects ทั้งหมดในบัคเก็ต (อันตราย!) ใช้: !gcsclear <bucket> [--prefix=<pref>]")
+    async def gcsclear(ctx: commands.Context, *, args: str):
         if not _gcs_admin_allow(ctx):
             return await ctx.reply("❌ คุณไม่มีสิทธิ์ใช้คำสั่งนี้", mention_author=False)
-    
-        # แยก args
+
         try:
             parts = shlex.split(args)
         except ValueError:
             return await ctx.reply("รูปแบบไม่ถูกต้อง", mention_author=False)
-    
+
         if not parts:
-            return await ctx.reply("ระบุชื่อบัคเก็ตด้วย เช่น `!gcsdelbucket my-bucket --force`", mention_author=False)
-    
+            return await ctx.reply("ระบุชื่อบัคเก็ตด้วย เช่น `!gcsclear my-bucket --prefix=discord_uploads/`", mention_author=False)
+
         bucket = parts[0]
-        force = any(p == "--force" for p in parts[1:])
-    
         prefix = None
-        user_project = None
         for p in parts[1:]:
             if p.startswith("--prefix="):
                 prefix = p.split("=", 1)[1] or None
-            elif p.startswith("--user-project="):
-                user_project = p.split("=", 1)[1] or None
-    
-        # แจ้งเตือนความเสี่ยง
-        warn_bits = [f"จะลบบัคเก็ต `{bucket}`"]
-        if force and prefix:
-            warn_bits.append(f"(ลบ objects ที่ prefix `{prefix}` ก่อน)")
-        elif force:
-            warn_bits.append("(ลบ objects ทั้งหมดก่อน)")
-        else:
-            warn_bits.append("(จะไม่ลบ objects ภายในก่อน)")
-        if user_project:
-            warn_bits.append(f"userProject=`{user_project}`")
-    
-        await ctx.send("⚠️ " + " ".join(warn_bits) + " — ดำเนินการต่อหรือไม่?", delete_after=10)
-    
+
+        warn = f"จะลบ **objects ทั้งหมด** ใน `gs://{bucket}`" + (f" ที่ prefix `{prefix}`" if prefix else "") + " — ระวัง!"
+        await ctx.send(f"⚠️ {warn}", delete_after=10)
+
+        msg = await ctx.reply("⏳ กำลังลบไฟล์…", mention_author=False)
+        try:
+            n = await gcs_delete_all_objects(bucket, prefix=prefix)
+            if n > 0:
+                await msg.edit(content=f"✅ ลบไฟล์แล้ว {n} ชิ้น จาก `gs://{bucket}`" + (f" (prefix=`{prefix}`)" if prefix else ""))
+            else:
+                await msg.edit(content=f"ℹ️ ไม่พบไฟล์ให้ลบใน `gs://{bucket}`" + (f" (prefix=`{prefix}`)" if prefix else ""))
+        except Exception as e:
+            await msg.edit(content=f"❌ ลบไม่สำเร็จ: `{type(e).__name__}: {e}`")
+
+    @bot.command(name="gcsdelbucket", help="ลบบัคเก็ต GCS (อันตราย!) ใช้: !gcsdelbucket <bucket> [--force] [--prefix=<pref>]")
+    async def gcsdelbucket(ctx: commands.Context, *, args: str):
+        if not _gcs_admin_allow(ctx):
+            return await ctx.reply("❌ คุณไม่มีสิทธิ์ใช้คำสั่งนี้", mention_author=False)
+
+        try:
+            parts = shlex.split(args)
+        except ValueError:
+            return await ctx.reply("รูปแบบไม่ถูกต้อง", mention_author=False)
+
+        if not parts:
+            return await ctx.reply("ระบุชื่อบัคเก็ตด้วย เช่น `!gcsdelbucket my-bucket --force`", mention_author=False)
+
+        bucket = parts[0]
+        force = any(p == "--force" for p in parts[1:])
+        prefix = None
+        for p in parts[1:]:
+            if p.startswith("--prefix="):
+                prefix = p.split("=", 1)[1] or None
+
+        warn = (
+            f"จะลบบัคเก็ต `{bucket}`"
+            + (" (ลบ objects ที่ prefix นี้ก่อน: `{}`)".format(prefix) if (force and prefix) else "")
+            + (" โดยจะลบ objects ทั้งหมดก่อน" if force and not prefix else "")
+            + (" โดยไม่ลบ objects ภายใน" if not force else "")
+            + " — ดำเนินการต่อหรือไม่?"
+        )
+        await ctx.send(f"⚠️ {warn}", delete_after=10)
+
         msg = await ctx.reply("⏳ กำลังดำเนินการ…", mention_author=False)
-        ok, text = await gcs_delete_bucket(bucket, force=force, prefix=prefix, user_project=user_project)
+        ok, text = await gcs_delete_bucket(bucket, force=force, prefix=prefix)
         await msg.edit(content=text)
