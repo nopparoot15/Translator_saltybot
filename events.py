@@ -1,4 +1,3 @@
-# events.py
 import os
 import logging
 import re
@@ -36,6 +35,19 @@ from config import GOOGLE_API_KEY, GCS_BUCKET_NAME, STT_DAILY_LIMIT_SECONDS, TZ
 from stt_select_panel import STTLanguagePanel, _to_stt_code
 
 logger = logging.getLogger(__name__)
+
+# ===== Helper: จำกัดขอบเขตช่องที่บอทรับผิดชอบ =====
+def _is_managed_channel(ch_id: int) -> bool:
+    """
+    คืน True ถ้าเป็นช่องที่บอทควรตอบกลับอัตโนมัติ
+    (ป้องกันไม่ให้ข้อความระบบ/แจ้งเตือน โผล่ไปช่องอื่น)
+    """
+    return (
+        (ch_id in AUTO_TTS_CHANNELS)
+        or (ch_id in DETAILED_EN_CHANNELS)
+        or (ch_id in DETAILED_JA_CHANNELS)
+        or (ch_id in TRANSLATION_CHANNELS)  # รองรับทั้ง "multi" และ tuple (src, tgt)
+    )
 
 # --- STT helpers (auto long-running + retry alts) ---
 _COMPRESSED_EXTS = {".mp3", ".m4a", ".ogg", ".opus", ".webm", ".mp4"}
@@ -421,15 +433,16 @@ def register_message_handlers(bot):
         if not text:
             return
 
-        # 4) emoji-only guard
+        # 4) emoji-only guard — จำกัดเฉพาะช่องที่บอทรับผิดชอบเท่านั้น
         if is_emoji_only(text):
-            try:
-                await message.channel.send("ℹ️ ข้ามการแปล/อ่านออกเสียง: ข้อความมีแค่อีโมจิอย่างเดียว")
-            except Exception:
-                pass
+            if _is_managed_channel(message.channel.id):
+                try:
+                    await message.channel.send("ℹ️ ข้ามการแปล/อ่านออกเสียง: ข้อความมีแค่อีโมจิอย่างเดียว")
+                except Exception:
+                    pass
             return
 
-        # 5) Auto TTS
+        # 5) Auto TTS (เฉพาะช่องที่เปิด)
         if message.channel.id in AUTO_TTS_CHANNELS:
             try:
                 await increment_user_usage(message.author.id, message.guild.id)
