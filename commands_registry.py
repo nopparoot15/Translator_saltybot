@@ -18,6 +18,7 @@ from translation_service import translator_server_engine, get_translator_engine
 from config import STT_DAILY_LIMIT_SECONDS, TZ, STT_QUOTA_SCOPE, REDIS_URL
 from gcs_admin import gcs_delete_bucket, gcs_delete_all_objects  # ⬅️ นำเข้าเพิ่ม
 
+
 def register_commands(bot: commands.Bot):
 
     # ---------- Helpers ----------
@@ -46,33 +47,33 @@ def register_commands(bot: commands.Bot):
         )
         embed.add_field(
             name="⚙️ General",
-            value="`!clear [จำนวน]` — ลบข้อความ (สูงสุด 500)\n`!topusers` — อันดับการใช้งานบอทในเซิร์ฟเวอร์",
+            value="`%clear [จำนวน]` — ลบข้อความ (สูงสุด 500)\n`%topusers` — อันดับการใช้งานบอทในเซิร์ฟเวอร์",
             inline=False
         )
         embed.add_field(
             name="🎙️ STT",
-            value="`!sttquota` — เช็คโควต้า STT รายวัน (วินาที)",
+            value="`%sttquota` — เช็คโควต้า STT รายวัน (วินาที)",
             inline=False
         )
         embed.add_field(
             name="🔊 TTS",
-            value="`!tts engine [user|server] [gtts|edge]` — ตั้งค่า TTS engine\n`!ttsstatus` — ดูสถานะ TTS ปัจจุบัน",
+            value="`%tts engine [user|server] [gtts|edge]` — ตั้งค่า TTS engine\n`%ttsstatus` — ดูสถานะ TTS ปัจจุบัน",
             inline=False
         )
         embed.add_field(
             name="🌐 Translation",
-            value="`!translator engine [gpt4omini|gpt5nano|google]` — ตั้งค่า Translator engine\n"
-                  "`!translator show` — ดู engine ที่ตั้งไว้\n"
-                  "`!translatorstatus` — ดูสถานะ Translator engine",
+            value="`%translator engine [gpt4omini|gpt5nano|google]` — ตั้งค่า Translator engine\n"
+                  "`%translator show` — ดู engine ที่ตั้งไว้\n"
+                  "`%translatorstatus` — ดูสถานะ Translator engine",
             inline=False
         )
-        embed.add_field(name="📸 OCR", value="`!ocr quota` — เช็คโควต้า OCR รายวัน", inline=False)
-        embed.add_field(name="🌐 Google Translate", value="`!gtrans` — เช็คโควต้า Google Translate ทั้งบอท", inline=False)
+        embed.add_field(name="📸 OCR", value="`%ocr quota` — เช็คโควต้า OCR รายวัน", inline=False)
+        embed.add_field(name="🌐 Google Translate", value="`%gtrans` — เช็คโควต้า Google Translate ทั้งบอท", inline=False)
         embed.add_field(
             name="☁️ GCS (ผู้ดูแลระบบ)",
             value=(
-                "`!gcsclear <bucket> [--prefix=<pref>]` — ลบ **objects ทั้งหมด** (หรือเฉพาะ prefix)\n"
-                "`!gcsdelbucket <bucket> [--force] [--prefix=<pref>]` — ลบบัคเก็ต (อันตรายมาก)"
+                "`%gcsclear <bucket> [--prefix=<pref>]` — ลบ **objects ทั้งหมด** (หรือเฉพาะ prefix)\n"
+                "`%gcsdelbucket <bucket> [--force] [--prefix=<pref>]` — ลบบัคเก็ต (อันตรายมาก)"
             ),
             inline=False
         )
@@ -107,16 +108,6 @@ def register_commands(bot: commands.Bot):
         guild_id = ctx.guild.id if ctx.guild else None
         user_id = ctx.author.id
         is_exempt = user_id in EXEMPT_USER_IDS
-
-        def _seconds_until_local_midnight(tz):
-            now = datetime.now(tz)
-            nxt = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
-            return max(0, int((nxt - now).total_seconds()))
-
-        def _fmt_hms(sec: int) -> str:
-            h, rem = divmod(sec, 3600)
-            m, s = divmod(rem, 60)
-            return f"{h}ชม {m}น {s}วิ" if h else (f"{m}น {s}วิ" if m else f"{s}วิ")
 
         if not is_exempt:
             try:
@@ -172,11 +163,11 @@ def register_commands(bot: commands.Bot):
             pass
 
         if len(args) != 3 or args[0].lower() != "engine":
-            await ctx.send("❗ ใช้งาน: `!tts engine [user|server] [gtts|edge]`", delete_after=8); return
+            await ctx.send("❗ ใช้งาน: `%tts engine [user|server] [gtts|edge]`", delete_after=8); return
         scope = args[1].lower().strip()
         engine = args[2].lower().strip()
         if scope not in {"user", "server"} or engine not in {"gtts", "edge"}:
-            await ctx.send("❗ ใช้งาน: `!tts engine [user|server] [gtts|edge]`", delete_after=8); return
+            await ctx.send("❗ ใช้งาน: `%tts engine [user|server] [gtts|edge]`", delete_after=8); return
 
         guild_id = ctx.guild.id if ctx.guild else 0
         if scope == "server":
@@ -220,7 +211,7 @@ def register_commands(bot: commands.Bot):
             else:
                 await ctx.send("❌ ไม่สามารถตรวจสอบโควต้า OCR ได้ในขณะนี้")
         else:
-            await ctx.send("❓ ใช้งาน: `!ocr quota` เพื่อดูโควต้า OCR วันนี้ของคุณ", delete_after=8)
+            await ctx.send("❓ ใช้งาน: `%ocr quota` เพื่อดูโควต้า OCR วันนี้ของคุณ", delete_after=8)
 
     # ---------- Leaderboard ----------
     @bot.command(name="topusers")
@@ -256,7 +247,7 @@ def register_commands(bot: commands.Bot):
 
         if not args:
             await ctx.send(
-                "❗ ใช้งาน: `!translator engine [gpt4omini|gpt5nano|google]` หรือ `!translator show`",
+                "❗ ใช้งาน: `%translator engine [gpt4omini|gpt5nano|google]` หรือ `%translator show`",
                 delete_after=10
             ); return
 
@@ -269,7 +260,7 @@ def register_commands(bot: commands.Bot):
             return
 
         if sub != "engine" or len(args) != 2:
-            await ctx.send("❗ ใช้งาน: `!translator engine [gpt4omini|gpt5nano|google]`", delete_after=8); return
+            await ctx.send("❗ ใช้งาน: `%translator engine [gpt4omini|gpt5nano|google]`", delete_after=8); return
 
         engine = args[1].lower().strip()
         if engine not in {"gpt4omini", "gpt5nano", "google"}:
@@ -326,7 +317,7 @@ def register_commands(bot: commands.Bot):
         perms = getattr(ctx.author, "guild_permissions", None)
         return bool(perms and (perms.administrator or perms.manage_guild))
 
-    @bot.command(name="gcsclear", help="ลบ objects ทั้งหมดในบัคเก็ต (อันตราย!) ใช้: !gcsclear <bucket> [--prefix=<pref>]")
+    @bot.command(name="gcsclear", help="ลบ objects ทั้งหมดในบัคเก็ต (อันตราย!) ใช้: %gcsclear <bucket> [--prefix=<pref>]")
     async def gcsclear(ctx: commands.Context, *, args: str):
         if not _gcs_admin_allow(ctx):
             return await ctx.reply("❌ คุณไม่มีสิทธิ์ใช้คำสั่งนี้", mention_author=False)
@@ -337,7 +328,7 @@ def register_commands(bot: commands.Bot):
             return await ctx.reply("รูปแบบไม่ถูกต้อง", mention_author=False)
 
         if not parts:
-            return await ctx.reply("ระบุชื่อบัคเก็ตด้วย เช่น `!gcsclear my-bucket --prefix=discord_uploads/`", mention_author=False)
+            return await ctx.reply("ระบุชื่อบัคเก็ตด้วย เช่น `%gcsclear my-bucket --prefix=discord_uploads/`", mention_author=False)
 
         bucket = parts[0]
         prefix = None
@@ -358,7 +349,7 @@ def register_commands(bot: commands.Bot):
         except Exception as e:
             await msg.edit(content=f"❌ ลบไม่สำเร็จ: `{type(e).__name__}: {e}`")
 
-    @bot.command(name="gcsdelbucket", help="ลบบัคเก็ต GCS (อันตราย!) ใช้: !gcsdelbucket <bucket> [--force] [--prefix=<pref>]")
+    @bot.command(name="gcsdelbucket", help="ลบบัคเก็ต GCS (อันตราย!) ใช้: %gcsdelbucket <bucket> [--force] [--prefix=<pref>]")
     async def gcsdelbucket(ctx: commands.Context, *, args: str):
         if not _gcs_admin_allow(ctx):
             return await ctx.reply("❌ คุณไม่มีสิทธิ์ใช้คำสั่งนี้", mention_author=False)
@@ -369,7 +360,7 @@ def register_commands(bot: commands.Bot):
             return await ctx.reply("รูปแบบไม่ถูกต้อง", mention_author=False)
 
         if not parts:
-            return await ctx.reply("ระบุชื่อบัคเก็ตด้วย เช่น `!gcsdelbucket my-bucket --force`", mention_author=False)
+            return await ctx.reply("ระบุชื่อบัคเก็ตด้วย เช่น `%gcsdelbucket my-bucket --force`", mention_author=False)
 
         bucket = parts[0]
         force = any(p == "--force" for p in parts[1:])
@@ -380,7 +371,7 @@ def register_commands(bot: commands.Bot):
 
         warn = (
             f"จะลบบัคเก็ต `{bucket}`"
-            + (" (ลบ objects ที่ prefix นี้ก่อน: `{}`)".format(prefix) if (force and prefix) else "")
+            + (f" (จะลบ objects ที่ prefix นี้ก่อน: `{prefix}`)" if (force and prefix) else "")
             + (" โดยจะลบ objects ทั้งหมดก่อน" if force and not prefix else "")
             + (" โดยไม่ลบ objects ภายใน" if not force else "")
             + " — ดำเนินการต่อหรือไม่?"
