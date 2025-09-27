@@ -37,11 +37,11 @@ def register_commands(bot: commands.Bot):
         return f"{s}วิ"
 
     # ---------- Commands ----------
-    @bot.command(name="commands")
+    @bot.command(name="help")
     async def show_commands(ctx: commands.Context):
         embed = discord.Embed(
             title="📜 รายการคำสั่งทั้งหมด",
-            description="คำสั่งหลักที่บอทรองรับ (prefix: `!`)",
+            description="คำสั่งหลักที่บอทรองรับ (prefix: `%`)",
             color=discord.Color.blue()
         )
         embed.add_field(
@@ -76,7 +76,7 @@ def register_commands(bot: commands.Bot):
             ),
             inline=False
         )
-        embed.set_footer(text="พิมพ์ !commands เพื่อเรียกดูรายการนี้ได้ตลอดเวลา")
+        embed.set_footer(text="พิมพ์ %help เพื่อเรียกดูรายการนี้ได้ตลอดเวลา")
         await ctx.send(embed=embed, delete_after=30)
 
     @bot.command(name="clear")
