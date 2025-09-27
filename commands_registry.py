@@ -20,6 +20,10 @@ from gcs_admin import gcs_delete_bucket, gcs_delete_all_objects  # ⬅️ นำ
 
 
 def register_commands(bot: commands.Bot):
+    try:
+        bot.remove_command("help")
+    except Exception:
+        pass
 
     # ---------- Helpers ----------
     def _seconds_until_local_midnight(tz) -> int:
