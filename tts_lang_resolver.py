@@ -1,3 +1,4 @@
+# tts_lang_resolver.py
 from __future__ import annotations
 import re
 from typing import List, Tuple, Optional
@@ -5,7 +6,7 @@ from lang_config import LANG_NAMES
 
 # ---------- Emoji patterns ----------
 _CUSTOM_EMOJI_RE = re.compile(r"<a?:[A-Za-z0-9_~]+:[0-9]+>")  # <:name:id> / <a:name:id>
-# Unicode emoji blocks (ครอบคลุมทั่วไป: Symbols & Pictographs, Dingbats, Misc Symbols, Flags)
+# Unicode emoji blocks (Symbols & Pictographs, Dingbats, Misc Symbols, Flags)
 _UNICODE_EMOJI_RE = re.compile(
     "[\U0001F300-\U0001FAFF\U00002700-\U000027BF\U00002600-\U000026FF\U0001F1E6-\U0001F1FF]+",
     flags=re.UNICODE,
@@ -46,7 +47,7 @@ def sanitize_requested_lang(req: str | None) -> str:
         return "auto"
     return req
 
-# gTTS languages normalize (ปรับให้เป็น lowercase key ทั้งหมด + รองรับ Filipino/Tagalog)
+# gTTS / Engine language normalize (lowercase keys + alias mapping)
 _GTTs_NORMALIZE = {
     # Chinese
     "zh": "zh-CN",
@@ -63,15 +64,31 @@ _GTTs_NORMALIZE = {
     "fil": "tl",
     "fil-ph": "tl",
     "tl-ph": "tl",
+    # Khmer BCP-47 collapse
+    "km-kh": "km",
+    "km_kh": "km",
+    # Burmese BCP-47 collapse
+    "my-mm": "my",
+    "my_mm": "my",
+    # Hindi BCP-47 collapse
+    "hi-in": "hi",
+    "hi_in": "hi",
+    # Arabic generic
+    "ar-sa": "ar",
+    "ar_eg": "ar",
+    "ar-eg": "ar",
+    "ar_ae": "ar",
+    "ar-ae": "ar",
+    # Vietnamese/Indonesian keep as is (gTTS expects 'vi', 'id')
 }
 
 def normalize_gtts_lang(code: str) -> tuple[str, str]:
     """
-    ทำให้โค้ดเข้ากับ gTTS ได้
-    คืน (gtts_key, display_code)
+    ทำให้โค้ดเข้ากับ gTTS/เอ็นจินได้
+    คืน (engine_key, display_code)
     - display_code ใช้สำหรับ log ให้สวย
     - รักษา 'zh-CN' / 'zh-TW' ไม่ให้ถูกลดรูป
-    - รองรับ 'fil'/'fil-PH'/'tl-PH' → 'tl'
+    - รองรับ alias ต่าง ๆ (fil→tl, km-KH→km, ฯลฯ)
     """
     if not code:
         return "en", "en"
@@ -83,7 +100,7 @@ def normalize_gtts_lang(code: str) -> tuple[str, str]:
     if mapped in ("zh-CN", "zh-TW"):
         return mapped, mapped
 
-    # gTTS ไม่แยกประเทศส่วนใหญ่ → ลดรูปเหลือภาษาหลัก
+    # ส่วนใหญ่ engine ไม่แยกประเทศ → ลดรูปเหลือภาษาหลัก (ยกเว้นจีน)
     if "-" in mapped:
         mapped = mapped.split("-")[0]
     return mapped, mapped
@@ -95,10 +112,9 @@ def normalize_parts_shape(parts: List[Tuple[str, str]]) -> List[Tuple[str, str]]
     for a, b in parts:
         t, lg = a, b
 
-        # เดิม: สลับถ้า b ไม่ใช่โค้ดภาษา แต่ a เป็นโค้ดภาษา
-        # ปรับ: "ถ้า b เป็น 'auto' ห้ามสลับ" กันเคส text สั้น ๆ เช่น "no", "it", "es" ฯลฯ
+        # สลับถ้า a เป็นโค้ดภาษา แต่ b ไม่ใช่ (เว้นกรณี b='auto')
         if (
-            (not _LANG_PATTERN.fullmatch(b or "")) and
+            (not _LANG_PATTERN.fullmatch((b or ""))) and
             _LANG_PATTERN.fullmatch((a or "").strip()) and
             (b or "").strip().lower() != "auto"
         ):
@@ -111,24 +127,39 @@ def normalize_parts_shape(parts: List[Tuple[str, str]]) -> List[Tuple[str, str]]
     return fixed
 
 
-# ---------- Language detection heuristics ----------
+# ---------- Language detection heuristics (script-based) ----------
 def _detect_script_fast_char(ch: str) -> str:
     """
-    เดาสคริปต์ต่อ 1 ตัวอักษร: th/ja/ko/ru/en/number/other
+    เดาสคริปต์ต่อ 1 ตัวอักษร:
+    th/ja/ko/ru/uk/en/km/my/hi/ar/number/other
+    หมายเหตุ:
+    - ru/uk ใช้บล็อค Cyrillic ร่วมกัน แยกด้วยตัวอักษรเฉพาะของ Ukrainian ในฟังก์ชันสูงกว่า
     """
     cp = ord(ch)
     # Thai
     if 0x0E00 <= cp <= 0x0E7F:
         return "th"
-    # Hiragana/Katakana/CJK
+    # Khmer + Khmer Symbols
+    if (0x1780 <= cp <= 0x17FF) or (0x19E0 <= cp <= 0x19FF):
+        return "km"
+    # Myanmar (Burmese)
+    if 0x1000 <= cp <= 0x109F:
+        return "my"
+    # Devanagari (Hindi and related)
+    if 0x0900 <= cp <= 0x097F:
+        return "hi"
+    # Arabic
+    if 0x0600 <= cp <= 0x06FF or 0x0750 <= cp <= 0x077F or 0x08A0 <= cp <= 0x08FF:
+        return "ar"
+    # Hiragana / Katakana / CJK Unified Ideographs
     if (0x3040 <= cp <= 0x30FF) or (0x4E00 <= cp <= 0x9FFF):
         return "ja"
     # Hangul
     if 0xAC00 <= cp <= 0xD7AF:
         return "ko"
-    # Cyrillic
+    # Cyrillic (ru/uk/etc.)
     if 0x0400 <= cp <= 0x04FF:
-        return "ru"
+        return "cyrl"
     # Latin letters
     if (0x0041 <= cp <= 0x005A) or (0x0061 <= cp <= 0x007A):
         return "en"
@@ -137,19 +168,31 @@ def _detect_script_fast_char(ch: str) -> str:
         return "number"
     return "other"
 
+# ชุดตัวอักษรเฉพาะของยูเครน เพื่อแยกระหว่าง ru/uk
+_UK_SPECIAL = set("ҐЄІЇґєії")
+
 def _detect_script_fast(s: str) -> str:
-    """เดาสคริปต์คร่าว ๆ ของสตริง: th/ja/ko/ru/en (fallback en)"""
+    """เดาสคริปต์คร่าว ๆ ของสตริง: th/ja/ko/ru/uk/en/km/my/hi/ar (fallback en)"""
+    has_cyrl = False
+    has_uk = False
     for ch in s:
         cat = _detect_script_fast_char(ch)
-        if cat in {"th", "ja", "ko", "ru", "en"}:
+        if cat in {"th", "ja", "ko", "en", "km", "my", "hi", "ar"}:
             return cat
+        if cat == "cyrl":
+            has_cyrl = True
+            if ch in _UK_SPECIAL:
+                has_uk = True
+    if has_cyrl:
+        return "uk" if has_uk else "ru"
     return "en"
+
 
 def resolve_tts_code(text: str, hint: str = "auto") -> str:
     """
     เดาภาษา TTS จากข้อความ (หลังตัด emoji แล้ว) + hint ('auto' หรือโค้ดภาษา)
     - ถ้า hint เป็นภาษาถูกต้อง → ใช้เลย
-    - ถ้า 'auto' → เดาตามสครिपต์
+    - ถ้า 'auto' → เดาตามสคริปต์ + heuristic
     """
     h = sanitize_requested_lang(hint)
     if h != "auto":
@@ -158,51 +201,48 @@ def resolve_tts_code(text: str, hint: str = "auto") -> str:
     if not clean:
         return "en"
     script = _detect_script_fast(clean)
-    if script == "ja":
-        return "ja"
-    if script == "th":
-        return "th"
-    if script == "ko":
-        return "ko"
-    if script == "ru":
-        return "ru"
+    if script in {"ja", "th", "ko", "ru", "uk", "km", "my", "hi", "ar"}:
+        return script
+    # Latin family → เดาภาษาโดยคำ
     return "en"
+
+
+# ---------- Latin-family word heuristics ----------
+_LATIN_HINTS = {
+    "de": r"\b(und|nicht|danke|nein|ja|ich|über|straße|eine|einen|sein|gibt)\b",
+    "fr": r"\b(et|merci|non|oui|je|vous|avec|être|c'est|pas|une|des|aux)\b",
+    "es": r"\b(gracias|hola|buenos|no|sí|por|favor|estoy|eres|porque|pero|muy)\b",
+    "pt": r"\b(obrigado|olá|não|sim|por|favor|você|está|bom|tudo)\b",
+    "it": r"\b(grazie|ciao|non|si|per|favore|sono|sei|bene)\b",
+    "fil": r"\b(salamat|maganda|mahal|kita|bakit|saan|paano|ito|iyan|iyon|wala|meron|opo|po|oo|hindi|kami|kayo|sila|ikaw|ako|mga|ang|ng|sa)\b",
+    "tl": r"\b(salamat|maganda|mahal|kita|bakit|saan|paano|ito|iyan|iyon|wala|meron|opo|po|oo|hindi|kami|kayo|sila|ikaw|ako|mga|ang|ng|sa)\b",
+    "vi": r"\b(xin|chào|cảm|ơn|không|vâng|tôi|bạn|anh|em|đẹp|yêu|đi|được|rất)\b",
+    "id": r"\b(terima|kasih|apa|kabar|tidak|ya|aku|kamu|anda|bagus|sekali)\b",
+    "pl": r"\b(dziękuję|cześć|nie|tak|jestem|jesteś|proszę|bardzo|dobrze)\b",
+    # uk พิมพ์ละตินไม่ใช่หลัก → ข้าม
+}
 
 def _guess_latin_language_by_words(t: str) -> str | None:
     """
     heuristic ง่าย ๆ สำหรับตัวอักษรละติน:
-    - ถ้าพบคำบางคำ → เดา de/fr/es/it/pt/fil
+    เดา de/fr/es/it/pt/fil/tl/vi/id/pl
     """
     s = t.lower()
-    # เยอรมัน
-    if re.search(r"\b(und|nicht|danke|nein|ja|ich|über|straße)\b", s):
-        return "de"
-    # ฝรั่งเศส
-    if re.search(r"\b(et|merci|non|oui|je|vous|avec|être)\b", s):
-        return "fr"
-    # สเปน
-    if re.search(r"\b(gracias|hola|buenos|no|sí|por|favor)\b", s):
-        return "es"
-    # โปรตุเกส
-    if re.search(r"\b(obrigado|olá|não|sim|por|favor)\b", s):
-        return "pt"
-    # อิตาลี
-    if re.search(r"\b(grazie|ciao|non|si|per|favore)\b", s):
-        return "it"
-    # ฟิลิปิโน/ตากาล็อก (คำบ่อยมาก)
-    if re.search(r"\b(ang|ng|mga|sa|ako|ikaw|siya|kami|kayo|sila|hindi|oo|opo|po|salamat|maganda|mahal|kita|bakit|saan|paano|ito|iyan|iyon|wala|meron)\b", s):
-        return "fil"
+    for code, pattern in _LATIN_HINTS.items():
+        if re.search(pattern, s):
+            return code
     return None
+
 
 def resolve_parts_for_tts(
     parts: List[Tuple[str, str]],
-    preferred_lang: Optional[str] = None,   # 🆕 เพิ่ม param
+    preferred_lang: Optional[str] = None,
 ) -> List[Tuple[str, str]]:
     """
-    เดาภาษารายท่อน + normalize โค้ดให้ gTTS ใช้ได้
+    เดาภาษารายท่อน + normalize โค้ดให้เอ็นจินใช้ได้
     ถ้ามี preferred_lang ให้เชื่อก่อน (ชนะ heuristic)
     """
-    # 🆕 short-circuit: ผู้ใช้ระบุภาษามา → ใช้ตามนั้นทุกท่อน
+    # short-circuit: ผู้ใช้ระบุภาษามา → ใช้ตามนั้นทุกท่อน
     if preferred_lang and preferred_lang.lower() != "auto":
         gtts_key, display = normalize_gtts_lang(preferred_lang)
         return [(text, display) for text, _ in normalize_parts_shape(parts)]
@@ -211,13 +251,13 @@ def resolve_parts_for_tts(
     for text, lg in normalize_parts_shape(parts):
         code = resolve_tts_code(text, lg)
 
-        # fine tune ละตินหน่อย
+        # fine tune: Latin-family → เดาเพิ่ม
         if code == "en":
             maybe = _guess_latin_language_by_words(text)
             if maybe:
                 code = maybe
 
-        # เดิม: CJK ไม่มีฮิระ/คะตะ → บังคับ zh-CN
+        # เดิม: ถ้าเป็น ja/en แต่เจอเฉพาะ Kanji (ไม่มีฮิระ/คะตะ) → บังคับ zh-CN
         if code in ("ja", "en"):
             has_hira_kata = bool(re.search(r"[\u3040-\u30FF]", text))
             has_cjk = bool(re.search(r"[\u4E00-\u9FFF]", text))
@@ -229,7 +269,7 @@ def resolve_parts_for_tts(
     return out
 
 
-# ---------- Text segmentation & merging (moved from bot.py) ----------
+# ---------- Text segmentation & merging ----------
 def split_text_by_script(text: str) -> List[Tuple[str, str]]:
     """
     แยกข้อความยาวเป็นชิ้น ๆ ตามชนิดสคริปต์ (ไทย/ญี่ปุ่น/ฯลฯ) เพื่อช่วยเลือกเสียงใน TTS
@@ -243,14 +283,16 @@ def split_text_by_script(text: str) -> List[Tuple[str, str]]:
 
         if ch_lang == "number":
             if current_lang:
-                # ถ้ามีบล็อกภาษาอยู่แล้ว ให้ตัวเลขตามบล็อกเดิม
                 current += ch
             else:
-                # ถ้ายังไม่มีภาษา ตีความเป็นไทยก่อน (อ่านเลขไทยเป็นธรรมชาติ)
                 if current:
                     parts.append((current, current_lang or "th"))
                 current, current_lang = ch, "th"
             continue
+
+        # รวมสคริปต์ย่อย Cyrillic ไปก่อน (ภายหลัง resolve จะเป็น ru/uk)
+        if ch_lang == "cyrl":
+            ch_lang = "ru"  # placeholder
 
         if ch_lang == current_lang:
             current += ch
@@ -282,7 +324,7 @@ def merge_adjacent_parts(parts: List[Tuple[str, str]]) -> List[Tuple[str, str]]:
     return merged
 
 
-# ---------- Cleaning translated text (moved from bot.py) ----------
+# ---------- Cleaning translated text ----------
 def clean_translation(src_text: str, translated: str) -> str:
     """
     ทำความสะอาดผลลัพธ์การแปลให้เหลือเฉพาะข้อความแปลล้วน ๆ
@@ -291,7 +333,7 @@ def clean_translation(src_text: str, translated: str) -> str:
     t = (translated or "").strip()
     # ตัดหัวป้ายบ่อย ๆ
     t = re.sub(r'^(แปลว่า|คำแปลคือ|หมายถึง|ความหมาย)\s*[:：-]?\s*', '', t, flags=re.I)
-    t = re.sub(r'^(Thai|TH|English|EN|Japanese|JA|Chinese|ZH|Korean|KO|Russian|RU|Vietnamese|VI)\s*[:：-]\s*', '', t, flags=re.I)
+    t = re.sub(r'^(Thai|TH|English|EN|Japanese|JA|Chinese|ZH|Korean|KO|Russian|RU|Vietnamese|VI|Filipino|Tagalog|TL|ID|FR|DE|ES|IT|PT)\s*[:：-]\s*', '', t, flags=re.I)
     # ตัดการ echo ต้นฉบับ
     src = (src_text or "").strip()
     if src:
@@ -305,6 +347,7 @@ def clean_translation(src_text: str, translated: str) -> str:
     t = re.sub(r"^```.*?\n", "", t, flags=re.S).strip()
     t = re.sub(r"\n```$", "", t, flags=re.S).strip()
     return t
+
 
 def safe_detect(text: str) -> str:
     """
@@ -329,7 +372,20 @@ def safe_detect(text: str) -> str:
     if d not in LANG_NAMES:  # ไม่รองรับในระบบเรา
         # ใช้ fast script detect
         script = _detect_script_fast(txt)
-        return script if script in LANG_NAMES else "en"
+        # แก้ให้ตรงกับ key ใน LANG_NAMES ถ้าเป็นจีน
+        if script == "ja":
+            # ถ้ามี Kanji แต่ไม่ใช่ hira/kata → บางกรณีเป็น zh
+            has_hira_kata = bool(re.search(r"[\u3040-\u30FF]", txt))
+            has_cjk = bool(re.search(r"[\u4E00-\u9FFF]", txt))
+            if has_cjk and not has_hira_kata:
+                return "zh-CN" if "zh-CN" in LANG_NAMES else ("zh" if "zh" in LANG_NAMES else "en")
+        # ถ้า script อยู่ใน LANG_NAMES ก็คืนเลย
+        if script in LANG_NAMES:
+            return script
+        # จีนแบบรวม key "zh"
+        if "zh" in LANG_NAMES and re.search(r"[\u4E00-\u9FFF]", txt):
+            return "zh"
+        return "en"
 
     return d
 
@@ -344,6 +400,6 @@ __all__ = [
     "normalize_parts_shape", "resolve_tts_code", "resolve_parts_for_tts",
     # segmentation / merging
     "split_text_by_script", "merge_adjacent_parts",
-    # cleaning
+    # cleaning / detection
     "clean_translation", "safe_detect",
 ]
