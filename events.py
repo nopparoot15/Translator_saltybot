@@ -38,18 +38,14 @@ logger = logging.getLogger(__name__)
 
 # ===== Helper: จำกัดขอบเขตช่องที่บอทรับผิดชอบ =====
 def _is_managed_channel(ch_id: int) -> bool:
-    """
-    คืน True ถ้าเป็นช่องที่บอทควรตอบกลับอัตโนมัติ
-    (ป้องกันไม่ให้ข้อความระบบ/แจ้งเตือน โผล่ไปช่องอื่น)
-    """
     return (
         (ch_id in AUTO_TTS_CHANNELS)
         or (ch_id in DETAILED_EN_CHANNELS)
         or (ch_id in DETAILED_JA_CHANNELS)
-        or (ch_id in TRANSLATION_CHANNELS)  # รองรับทั้ง "multi" และ tuple (src, tgt)
+        or (ch_id in TRANSLATION_CHANNELS)
     )
 
-# --- STT helpers (auto long-running + retry alts) ---
+# --- STT helpers ---
 _COMPRESSED_EXTS = {".mp3", ".m4a", ".ogg", ".opus", ".webm", ".mp4"}
 
 def _is_compressed(name: str, content_type: str) -> bool:
@@ -64,17 +60,17 @@ def _is_compressed(name: str, content_type: str) -> bool:
     )
 
 def _should_force_longrun(size_bytes: int, name: str, content_type: str) -> bool:
-    # ไฟล์บีบอัด > ~1.8MB มักยาวเกิน 1 นาที → บังคับ long-running
     if _is_compressed(name, content_type):
         return size_bytes > 1_800_000
-    # ไฟล์ไม่บีบอัด (wav/flac) ใช้เพดานเดิม
     return size_bytes > 9_000_000
 
 def _ensure_alts_for_code_switch(base_lang_code: str, alt_iso: list[str] | None) -> list[str]:
     alts = list(alt_iso or [])
-    # ไทยปนอังกฤษบ่อย → เติม en
-    if (base_lang_code or "").lower().startswith("th") and "en" not in [a.split("-")[0].lower() for a in alts]:
-        alts = ["en"] + alts
+    fam = (base_lang_code or "").split("-")[0].lower()
+    if fam in {"th", "km", "my"}:   # ไทย/เขมร/พม่า → ชอบปนอังกฤษ
+        fams = [a.split("-")[0].lower() for a in alts]
+        if "en" not in fams:
+            alts = ["en"] + alts
     return alts[:3]
 
 _TH_RE = re.compile(r'[\u0E00-\u0E7F]')
@@ -86,14 +82,10 @@ def register_message_handlers(bot):
     async def _on_message(message):
         if message.author.bot:
             return
-
-        # ให้ commands framework จัดการเอง
         if message.content.startswith("!"):
             return
 
-        logger.info(f"[DEBUG] 📥 from={message.author} | channel={message.channel.id} | attachments={len(message.attachments)}")
-
-        # 2) OCR / STT เฉพาะห้อง multi ที่แนบไฟล์
+        # ========== OCR / STT ==========
         channel_cfg = TRANSLATION_CHANNELS.get(message.channel.id)
         if channel_cfg == "multi" and message.attachments:
             valid_img_exts = (".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tiff", ".tif")
@@ -108,7 +100,7 @@ def register_message_handlers(bot):
                 or (a.content_type or "").startswith(("audio/", "video/"))
             ]
 
-            # ---- (A) OCR ----
+            # ---- OCR ----
             if image_attachments:
                 for attachment in image_attachments[:1]:
                     try:
@@ -121,7 +113,6 @@ def register_message_handlers(bot):
                             if result_text.strip().startswith(("❌", "⏳")):
                                 await message.channel.send(result_text)
                                 continue
-
                             safe_text = result_text.replace("```", "``\u200b`")
                             await message.channel.send(
                                 content=f"📝 Extracted text:\n```{safe_text}```",
@@ -136,24 +127,19 @@ def register_message_handlers(bot):
                                 mention_author=False,
                             )
                     except Exception as e:
-                        logger.exception(f"❌ OCR(multi) handler error: {e}")
-                        await message.channel.send(f"❌ เกิดข้อผิดพลาดระหว่าง OCR (multi): {e}")
+                        logger.exception(f"❌ OCR error: {e}")
+                        await message.channel.send(f"❌ เกิดข้อผิดพลาดระหว่าง OCR: {e}")
                 return
 
-            # ---- (B) STT ----
+            # ---- STT ----
             if audio_attachments:
                 a = audio_attachments[0]
                 filename = (a.filename or "").lower()
                 content_type = (a.content_type or "").lower()
 
                 async def _run_stt_with_lang(interaction, base_lang_code: str):
-                    """
-                    ถอดเสียงตามภาษาที่ผู้ใช้เลือก + โควต้า STT ต่อวันใน Redis
-                    - รอบแรก: ส่ง "ภาษาเดียว" ที่ผู้ใช้เลือก (ไม่มี alt) → กันหลุดไปภาษาอื่น
-                    - ถ้าผลว่าง/ภาษาไม่ตรง → รอบสองค่อยลองรวม alt-langs (เช่น en-US)
-                    - เลือก long-running อัตโนมัติสำหรับไฟล์บีบอัด > ~1.8MB
-                    """
-                    flag = FLAGS.get(base_lang_code, FLAGS.get(base_lang_code.split("-")[0], "")) or ""
+                    base_lang_code_bcp = _to_stt_code(base_lang_code)
+                    flag = FLAGS.get(base_lang_code_bcp, FLAGS.get(base_lang_code_bcp.split("-")[0], "")) or ""
                     progress_msg = None
 
                     async def _status(msg: str):
@@ -161,59 +147,52 @@ def register_message_handlers(bot):
                         try:
                             if progress_msg is None:
                                 progress_msg = await message.channel.send(
-                                    f"{flag} {msg} (`{base_lang_code}`)",
+                                    f"{flag} {msg} (`{base_lang_code_bcp}`)",
                                     reference=message,
                                     mention_author=False,
                                 )
                             else:
-                                await progress_msg.edit(content=f"{flag} {msg} (`{base_lang_code}`)")
+                                await progress_msg.edit(content=f"{flag} {msg} (`{base_lang_code_bcp}`)")
                         except Exception:
                             pass
 
                     tmp_path = None
                     reserved_sec = 0
                     try:
-                        # ==== 0) เตรียมไฟล์ชั่วคราว + วัดความยาว เพื่อ "จอง" โควต้า ====
+                        # เตรียมไฟล์
                         await _status("กำลังเตรียมไฟล์เสียง…")
                         tmp_path = await download_to_temp(a)
                         dur_sec = await probe_duration_seconds(tmp_path)
-                        if dur_sec <= 0:
-                            # ถ้าวัดไม่ได้ ให้กันขั้นต่ำ 60 วิ (กันฟรีพาสไฟล์ยาว)
-                            dur_sec = 60
+                        if dur_sec <= 0: dur_sec = 60
                         reserved_sec = int(dur_sec)
 
-                        # จองโควต้าก่อนเริ่มทำงาน (อะตอมมิก)
                         guild_id = message.guild.id if message.guild else None
                         user_id = message.author.id
                         ok = await stt_try_reserve(user_id, guild_id, reserved_sec, STT_DAILY_LIMIT_SECONDS, TZ)
                         if not ok:
                             used = await stt_get_used(user_id, guild_id, TZ)
                             remain = max(0, STT_DAILY_LIMIT_SECONDS - int(used))
-                            reset_note = "โควต้าจะรีเซ็ต 00:00 (Asia/Bangkok)"
                             await _status("❌ เกินโควต้า STT วันนี้")
                             await message.channel.send(
-                                f"❌ **เกินโควต้า STT วันนี้** — ใช้ไป {used}s / {STT_DAILY_LIMIT_SECONDS}s (เหลือ {remain}s)\n{reset_note}",
+                                f"❌ ใช้โควต้า STT หมดแล้ว — ใช้ไป {used}s / {STT_DAILY_LIMIT_SECONDS}s (เหลือ {remain}s)",
                                 reference=message, mention_author=False
                             )
                             return
 
-                        # ==== 1) อ่าน bytes เพื่อส่งเข้า STT ====
-                        await _status("กำลังเตรียมไฟล์เสียง…")
                         with open(tmp_path, "rb") as f:
                             raw_bytes = f.read()
                         if not raw_bytes:
                             await _status("❌ ไม่สามารถอ่านไฟล์เสียงได้")
-                            # คืนโควต้าที่เพิ่งจอง
                             await stt_refund(user_id, guild_id, reserved_sec, TZ)
                             return
 
                         await increment_user_usage(message.author.id, message.guild.id)
 
-                        # บังคับให้เข้ากับ STT (WAV 16k mono เมื่อจำเป็น)
+                        # เข้ากับ STT
                         audio_bytes, fn, ctype, did_trans = await ensure_stt_compatible(filename, content_type, raw_bytes)
                         filename2, content_type2 = fn, ctype
 
-                        # เดา alts จากบริบท/ประวัติ (ไว้สำหรับรอบถัดไป)
+                        # alts
                         context_bias = detect_lang_hints_from_context(
                             username=str(message.author),
                             channel_name=getattr(message.channel, "name", "") or "",
@@ -221,141 +200,67 @@ def register_message_handlers(bot):
                         )
                         channel_hist = await get_channel_lang_hist(message.channel.id)
                         user_hist    = await get_user_lang_hist(message.author.id)
-                        iso_base = (base_lang_code or "").split("-")[0]
-                        alt_iso = pick_alternative_langs(
-                            base_lang=iso_base, max_alts=3,
-                            channel_hist=channel_hist, user_hist=user_hist,
-                            context_bias=context_bias,
-                        )
-                        # ใส่ en สำหรับไทย และจำกัด 3 ตัว
-                        alt_iso_first = _ensure_alts_for_code_switch(base_lang_code, alt_iso)
+                        iso_base = (base_lang_code_bcp or "").split("-")[0]
+                        alt_iso = pick_alternative_langs(iso_base, 3, channel_hist, user_hist, context_bias)
+                        alt_iso_first = _ensure_alts_for_code_switch(base_lang_code_bcp, alt_iso)
 
-                        # เลือกโหมดด้วยเฮอร์ริสติก (บีบอัด > 1.8MB → long-running)
                         use_long = _should_force_longrun(len(audio_bytes), filename2, content_type2)
                         stt_mode = "google longrunning" if use_long else "google sync"
                         await _status(f"กำลังเริ่มถอดเสียง… (โหมด: {stt_mode})")
 
-                        # longrunning → แปลง wav 16k mono เพื่อความชัวร์
                         if use_long:
                             try:
-                                audio_bytes = await transcode_to_wav_pcm16(
-                                    audio_bytes, rate=16000, ch=1,
-                                    src_ext=os.path.splitext(filename2)[1], content_type=content_type2
-                                )
+                                audio_bytes = await transcode_to_wav_pcm16(audio_bytes, 16000, 1,
+                                                                           os.path.splitext(filename2)[1], content_type2)
                                 filename2 = f"{os.path.splitext(filename2)[0]}.wav"
                                 content_type2 = "audio/wav"
                             except Exception:
-                                # ไม่ล้มงาน
                                 pass
 
                         async def _run_once(alts_iso: list[str] | None):
-                            # แปลง ISO → BCP-47 เฉพาะตอนมี alts
                             alts_bcp = [_to_stt_code(c) for c in (alts_iso or [])[:3]] if alts_iso else None
-                        
                             if use_long:
-                                lr_kwargs = dict(
+                                return await transcribe_long_audio_bytes(
                                     audio_bytes=audio_bytes,
                                     file_ext=os.path.splitext(filename2)[1] or ".wav",
-                                    content_type=content_type2 or None,
+                                    content_type=content_type2,
                                     bucket_name=GCS_BUCKET_NAME,
-                                    lang_hint=base_lang_code,
+                                    lang_hint=base_lang_code_bcp,
+                                    alternative_language_codes=alts_bcp,
                                     poll=True,
                                     max_wait_sec=900.0,
                                     audio_channel_count=1,
                                     enable_separate_recognition_per_channel=False,
                                 )
-                                if alts_bcp:
-                                    lr_kwargs["alternative_language_codes"] = alts_bcp
-                                return await transcribe_long_audio_bytes(**lr_kwargs)
                             else:
-                                sync_kwargs = dict(
+                                return await stt_transcribe_bytes(
                                     audio_bytes=audio_bytes,
                                     api_key=GOOGLE_API_KEY,
                                     filename=a.filename,
                                     content_type=content_type2,
-                                    lang_hint=base_lang_code,
+                                    lang_hint=base_lang_code_bcp,
                                     enable_punctuation=True,
                                     max_alternatives=1,
+                                    alternative_language_codes=alts_bcp,
+                                    sample_rate_hz=16000 if content_type2.startswith("audio/wav") else None,
                                     timeout_s=90.0,
                                 )
-                                if alts_bcp:
-                                    sync_kwargs["alternative_language_codes"] = alts_bcp
-                                if content_type2.startswith("audio/wav") or filename2.endswith(".wav"):
-                                    sync_kwargs.update(sample_rate_hz=16000, audio_channel_count=1,
-                                                       enable_separate_recognition_per_channel=False)
-                                elif filename2.endswith((".ogg", ".opus")) or "opus" in content_type2:
-                                    sync_kwargs.update(sample_rate_hz=48000)
-                                else:
-                                    sync_kwargs.update(audio_channel_count=1,
-                                                       enable_separate_recognition_per_channel=False)
-                                return await stt_transcribe_bytes(**sync_kwargs)
 
-                        # รอบ 1: ภาษาเดียว ไม่มี alt (ล็อกภาษาให้ตรงกับที่เลือก)
+                        # run1
                         await _status("กำลังถอดเสียง…")
                         text, raw = await _run_once(None)
 
-                        # ถ้า error ฝั่ง API
-                        if text.startswith("❌") or (isinstance(raw, dict) and raw.get("error")):
-                            err_preview = ""
-                            if isinstance(raw, dict):
-                                try:
-                                    err_preview = (raw.get("error") or "")[:400]
-                                except Exception:
-                                    pass
-                            await _status("❌ ถอดเสียงไม่สำเร็จ")
-                            await message.channel.send(
-                                f"{text}\n{err_preview}" if err_preview else text,
-                                reference=message, mention_author=False
-                            )
-                            # คืนโควต้าเพราะไม่สำเร็จ
-                            await stt_refund(user_id, guild_id, reserved_sec, TZ)
-                            return
-
-                        # รอบ 2: ถ้าว่าง หรือภาษาไม่ตรง (เช่นเลือก th แต่ไม่มีอักษรไทย) → ลองใส่ alt
-                        need_retry_with_alts = False
+                        # retry
                         if not (text or "").strip():
-                            need_retry_with_alts = True
-                        elif base_lang_code.lower().startswith("th") and not _looks_thai(text):
-                            need_retry_with_alts = True
-
-                        if need_retry_with_alts:
-                            await _status("ยังไม่ได้ข้อความ/ภาษาไม่ตรง ลองรวมภาษาใกล้เคียง…")
                             text2, raw2 = await _run_once(alt_iso_first)
                             if (text2 or "").strip():
                                 text, raw = text2, raw2
 
-                        # รอบ 3: transcode ใหม่แล้วลอง (หากตอนแรกยังไม่ได้และเรายังไม่ได้แปลง)
-                        if not (text or "").strip() and not did_trans:
-                            try:
-                                await _status("กำลังปรับรูปแบบเสียงใหม่ แล้วลองอีกครั้ง…")
-                                reb_bytes = await transcode_to_wav_pcm16(
-                                    raw_bytes, rate=16000, ch=1,
-                                    src_ext=os.path.splitext(a.filename or "")[1],
-                                    content_type=(a.content_type or "")
-                                )
-                                filename2 = f"{os.path.splitext(filename2)[0]}.wav"
-                                content_type2 = "audio/wav"
-                                audio_bytes = reb_bytes
-
-                                # ประเมินโหมดใหม่จากขนาดจริงหลังแปลง
-                                use_long = _should_force_longrun(len(reb_bytes), filename2, content_type2)
-                                stt_mode = "google longrunning" if use_long else "google sync"
-
-                                t3, r3 = await _run_once(None)
-                                if not (t3 or "").strip():
-                                    t4, r4 = await _run_once(alt_iso_first)
-                                    text, raw = (t4, r4) if (t4 or "").strip() else (t3, r3)
-                                else:
-                                    text, raw = t3, r3
-                            except Exception:
-                                pass
-
                         if not (text or "").strip():
-                            await _status("⚠️ ไม่พบข้อความจากเสียง (หรือเสียงไม่ชัดพอ)")
-                            # ถือว่าใช้งานแล้ว (ไม่ refund) เพราะโควต้าถูกกันตามความยาวไฟล์
+                            await _status("⚠️ ไม่พบข้อความจากเสียง")
                             return
 
-                        # บันทึก histogram
+                        # hist
                         try:
                             lang_seen = detect_script_from_text(text)
                             await incr_channel_lang_hist(message.channel.id, lang_seen)
@@ -363,24 +268,15 @@ def register_message_handlers(bot):
                         except Exception:
                             pass
 
-                        # ลบสถานะก่อนส่งผลลัพธ์จริง
-                        try:
-                            if progress_msg:
-                                await progress_msg.delete()
-                        except Exception:
-                            pass
+                        if progress_msg:
+                            try: await progress_msg.delete()
+                            except: pass
 
-                        # ส่ง Transcript (reply ไปที่ไฟล์ + โชว์โค้ดภาษาที่เลือก)
                         sent_msg = await send_transcript(
-                            message,
-                            text,
-                            stt_tag=stt_mode,
-                            lang_display=base_lang_code,
-                            show_engine=False,
-                            reply_to=message,
+                            message, text, stt_tag=stt_mode,
+                            lang_display=base_lang_code_bcp,
+                            show_engine=False, reply_to=message,
                         )
-
-                        # แนบปุ่มฟัง/แปล
                         try:
                             view = OCRListenTranslateView(
                                 original_text=text,
@@ -392,81 +288,61 @@ def register_message_handlers(bot):
                             await sent_msg.edit(view=view)
                         except Exception:
                             pass
-
                     except Exception as e:
-                        # ลบสถานะถ้ามี แล้วแจ้ง error ปกติ
-                        try:
-                            if progress_msg:
-                                await progress_msg.delete()
-                        except Exception:
-                            pass
-                        logger.exception(f"❌ STT(multi) handler error: {e}")
+                        if progress_msg:
+                            try: await progress_msg.delete()
+                            except: pass
+                        logger.exception(f"❌ STT error: {e}")
                         await message.channel.send("❌ เกิดข้อผิดพลาดระหว่างถอดเสียง", reference=message, mention_author=False)
-                        # คืนโควต้ากรณีล้มเหลวกลางทาง
                         try:
-                            guild_id = message.guild.id if message.guild else None
-                            user_id = message.author.id
                             if reserved_sec > 0:
                                 await stt_refund(user_id, guild_id, reserved_sec, TZ)
-                        except Exception:
-                            pass
+                        except: pass
                     finally:
                         if tmp_path:
-                            try:
-                                os.remove(tmp_path)
-                            except Exception:
-                                pass
+                            try: os.remove(tmp_path)
+                            except: pass
 
-                # แสดงแผงเลือกภาษา
                 panel = STTLanguagePanel(
                     source_message=message,
                     on_choose_lang=_run_stt_with_lang,
                     flags=FLAGS,
-                    major_langs=["th", "en", "ja"],
+                    major_langs=["th", "en", "ja", "km", "my", "zh"],
                     major_primary="th",
                 )
                 await panel.attach(message.channel)
                 return
 
-        # 3) ไม่มีไฟล์ → ถ้าไม่มีข้อความก็ออก
+        # ========== ข้อความปกติ ==========
         text = (message.content or "").strip()
         if not text:
             return
 
-        # 4) emoji-only guard — จำกัดเฉพาะช่องที่บอทรับผิดชอบเท่านั้น
         if is_emoji_only(text):
             if _is_managed_channel(message.channel.id):
-                try:
-                    await message.channel.send("ℹ️ ข้ามการแปล/อ่านออกเสียง: ข้อความมีแค่อีโมจิอย่างเดียว")
-                except Exception:
-                    pass
+                try: await message.channel.send("ℹ️ ข้าม: มีแค่อีโมจิ")
+                except: pass
             return
 
-        # 5) Auto TTS (เฉพาะช่องที่เปิด)
         if message.channel.id in AUTO_TTS_CHANNELS:
             try:
                 await increment_user_usage(message.author.id, message.guild.id)
                 parts = merge_adjacent_parts(split_text_by_script(text))
-                cleaned_parts = resolve_parts_for_tts(parts)
-                await speak_text_multi(message, cleaned_parts)
+                await speak_text_multi(message, resolve_parts_for_tts(parts))
             except Exception as e:
-                logger.error(f"❌ Auto TTS multi-lang failed: {e}")
+                logger.error(f"❌ Auto TTS failed: {e}")
             return
 
-        # 6) Translation
         if message.channel.id in TRANSLATION_CHANNELS:
             await increment_user_usage(message.author.id, message.guild.id)
 
-            # DETAILED EN
             if message.channel.id in DETAILED_EN_CHANNELS:
                 if len(text) > MAX_INPUT_LENGTH:
-                    await message.channel.send("❗ ข้อความยาวเกินไปสำหรับการวิเคราะห์แบบละเอียด กรุณาส่งประโยคสั้นลง")
+                    await message.channel.send("❗ ข้อความยาวเกินไป")
                     return
                 prompt = (
-                    "วิเคราะห์ประโยคภาษาอังกฤษต่อไปนี้เป็นภาษาไทย โดยอธิบายให้เข้าใจง่าย:\n"
-                    "- คำศัพท์: ชนิดคำ ความหมาย ตัวอย่าง\n"
-                    "- ไวยากรณ์: tense โครงสร้าง คำเชื่อม\n"
-                    "- สรุป: คำแปลไทยอย่างเป็นธรรมชาติของประโยคทั้งหมด\n\n"
+                    "วิเคราะห์ประโยคภาษาอังกฤษต่อไปนี้เป็นภาษาไทย:\n"
+                    "- คำศัพท์/ไวยากรณ์\n- สรุปคำแปล\n\n"
                     f"ประโยค: {text}"
                 )
                 from translation_service import get_translation
@@ -474,18 +350,13 @@ def register_message_handlers(bot):
                 await send_long_message(message.channel, (ans or "").strip())
                 return
 
-            # DETAILED JA
             if message.channel.id in DETAILED_JA_CHANNELS:
                 if len(text) > MAX_INPUT_LENGTH:
-                    await message.channel.send("❗ ข้อความยาวเกินไปสำหรับการวิเคราะห์แบบละเอียด กรุณาส่งประโยคสั้นลง")
+                    await message.channel.send("❗ ข้อความยาวเกินไป")
                     return
                 prompt = (
-                    "วิเคราะห์ประโยคภาษาญี่ปุ่นต่อไปนี้เป็นภาษาไทย แบบกระชับ:\n"
-                    "- คำศัพท์: Kanji/Hiragana/Romaji/ความหมาย/ชนิดคำ\n"
-                    "- คำช่วย: หน้าที่\n"
-                    "- ไวยากรณ์: โครงสร้างหลัก/tense/ความหมายตามบริบท\n"
-                    "- ตัวอย่างใหม่ 1 ประโยค พร้อมคำแปลไทย\n"
-                    "- สรุป: ต้นฉบับ/คำอ่าน(Hira+Romaji)/คำแปลไทย\n\n"
+                    "วิเคราะห์ประโยคภาษาญี่ปุ่นต่อไปนี้เป็นภาษาไทย:\n"
+                    "- คำศัพท์/คำช่วย/ไวยากรณ์\n- ตัวอย่างใหม่\n- คำแปล\n\n"
                     f"ประโยค: {text}"
                 )
                 from translation_service import get_translation
@@ -493,7 +364,6 @@ def register_message_handlers(bot):
                 await send_long_message(message.channel, (ans or "").strip())
                 return
 
-            # NORMAL & MULTI via panel/direct
             cfg = TRANSLATION_CHANNELS.get(message.channel.id)
             if cfg == "multi":
                 panel = TwoWayTranslatePanel(
@@ -510,38 +380,27 @@ def register_message_handlers(bot):
                 await panel.attach(message.channel)
                 return
             else:
-                # bi-directional
                 src_lang, tgt_lang = cfg or ("", "")
-                try:
-                    lang = safe_detect(text)
-                except Exception:
-                    lang = ""
+                try: lang = safe_detect(text)
+                except: lang = ""
                 target_lang = tgt_lang if lang == src_lang else src_lang
                 lang_name = LANG_NAMES.get(target_lang, "ภาษาปลายทาง")
                 flag = FLAGS.get(target_lang, "")
                 voice_lang = target_lang
 
-                approx_tokens = len((text or "").encode("utf-8")) // 3
+                approx_tokens = len(text.encode("utf-8")) // 3
                 if approx_tokens > MAX_APPROX_TOKENS:
-                    await message.channel.send("❗ ข้อความหรือคำอธิบายยาวเกินไป ไม่สามารถแปลได้")
+                    await message.channel.send("❗ ยาวเกินไป")
                     return
 
-                translated = await translate_with_provider(message, text, target_lang, lang_name)
-                translated = (translated or "").strip()
-                if not translated:
-                    await message.channel.send("⚠️ แปลไม่สำเร็จ")
-                    return
-                if translated.lower() == text.strip().lower():
+                translated = (await translate_with_provider(message, text, target_lang, lang_name) or "").strip()
+                if not translated or translated.lower() == text.lower():
                     return
                 if translated.startswith(("❌", "⚠️")):
                     await message.channel.send(translated)
                     return
-
                 await send_long_message(message.channel, f"{flag} {translated}")
-
                 try:
-                    vl_norm = voice_lang.lower().replace("_", "-")
-                    vl = "zh-CN" if vl_norm in {"zh", "zh-cn"} else voice_lang
+                    vl = _to_stt_code(voice_lang)
                     await speak_text_multi(message, [(translated, vl)], playback_rate=1.0, preferred_lang=vl)
-                except Exception:
-                    pass
+                except: pass
