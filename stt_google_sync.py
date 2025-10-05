@@ -1,14 +1,3 @@
-# stt_google_sync.py
-# ------------------------------------------------------------
-# Google Speech-to-Text (Synchronous)
-# ใช้กับไฟล์ "สั้น/ขนาดไม่ใหญ่มาก" (≤ ~1 นาที หรือ ≤ ~8-9MB)
-# ถ้าไฟล์ยาว/ใหญ่ ระบบนี้จะ fallback ไปใช้ long-running (stt_google_async)
-#
-# Public APIs:
-#   - stt_transcribe_bytes(...) -> (text, raw_json)
-#   - stt_transcribe_file(path, ...) -> (text, raw_json)
-# ------------------------------------------------------------
-
 from __future__ import annotations
 
 import base64
@@ -55,30 +44,72 @@ def _mime_to_encoding(mime: str, filename: Optional[str]) -> str:
     # AAC/MP4 อาจถอดไม่ตรง → แนะนำ transcode เป็น WAV ถ้าเจอปัญหา
     return "ENCODING_UNSPECIFIED"
 
+# ---------- Language normalization ----------
+# แปลงโค้ดสั้น/alias → BCP-47 ที่ Google STT ชอบ
+# (คงปล่อยผ่านถ้า caller ส่ง BCP-47 ที่ถูกต้องมาแล้ว)
+_LANG_MAP_BASE_TO_BCP = {
+    # เอเชียตะวันออก/ตะวันออกเฉียงใต้
+    "th": "th-TH",
+    "en": "en-US",
+    "ja": "ja-JP",
+    "zh": "cmn-Hans-CN",   # จีนกลางตัวง่าย (ค่าเริ่มต้น); ไต้หวันใช้ "cmn-Hant-TW"
+    "ko": "ko-KR",
+    "vi": "vi-VN",
+    "id": "id-ID",
+    "tl": "tl-PH",
+    "fil": "fil-PH",
+    "km": "km-KH",
+    "my": "my-MM",
+    # เอเชียใต้/ตะวันออกกลาง
+    "hi": "hi-IN",
+    "ar": "ar-SA",         # ถ้าต้องอียิปต์: "ar-EG"
+    # ยุโรป
+    "ru": "ru-RU",
+    "uk": "uk-UA",
+    "fr": "fr-FR",
+    "de": "de-DE",
+    "es": "es-ES",
+    "it": "it-IT",
+    "pt": "pt-PT",
+    "pl": "pl-PL",
+    # กวางตุ้ง (ผู้ใช้บางเคสอยากบังคับ)
+    "yue": "yue-Hant-HK",
+    # จีนตัวเต็มแบบค่าเริ่มต้น
+    "zh-tw": "cmn-Hant-TW",
+    "zh_tw": "cmn-Hant-TW",
+    "zh-cn": "cmn-Hans-CN",
+    "zh_cn": "cmn-Hans-CN",
+}
+
 def _norm_lang(code: Optional[str]) -> Optional[str]:
     """ทำให้ languageCode เป็น BCP-47 ที่ Google STT ชอบ"""
     if not code:
         return None
-    mapping = {
-        "th": "th-TH",
-        "en": "en-US",
-        "ja": "ja-JP",
-        "zh": "cmn-Hans-CN",   # จีนกลาง (ตัวง่าย); ถ้าต้องจีนไต้หวัน: 'cmn-Hant-TW'
-        "ko": "ko-KR",
-        "vi": "vi-VN",
-        "ru": "ru-RU",
-        "fr": "fr-FR",
-        "de": "de-DE",
-        "es": "es-ES",
-        "it": "it-IT",
-        "pt": "pt-PT",
-        "pl": "pl-PL",
-        "uk": "uk-UA",
-        "ar": "ar-EG",
-        "hi": "hi-IN",
-    }
-    base = code.strip().lower().split("-")[0]
-    return mapping.get(base, code)
+    c = code.strip()
+    low = c.lower().replace("_", "-")
+    base = low.split("-")[0]
+    # ถ้า caller ส่ง BCP-47 ที่ถูกต้องอยู่แล้ว ปล่อยผ่าน
+    if "-" in low and base not in _LANG_MAP_BASE_TO_BCP:
+        return c
+    # map base/alias → BCP-47
+    mapped = _LANG_MAP_BASE_TO_BCP.get(low) or _LANG_MAP_BASE_TO_BCP.get(base)
+    return mapped or c
+
+def _norm_alt_codes(codes: Optional[List[str]]) -> Optional[List[str]]:
+    """normalize รายการ alt ให้เป็น BCP-47 ทั้งหมด และลบซ้ำ"""
+    if not codes:
+        return None
+    out: List[str] = []
+    seen = set()
+    for x in codes:
+        m = _norm_lang(x)
+        if not m:
+            continue
+        key = m.lower()
+        if key not in seen:
+            out.append(m)
+            seen.add(key)
+    return out or None
 
 def _guess_ext(filename: Optional[str], mime: str) -> str:
     """เดา .ext สำหรับส่งให้ long-running"""
@@ -162,7 +193,7 @@ async def stt_transcribe_bytes(
     filename: Optional[str] = None,
     content_type: Optional[str] = None,
     # การตั้งค่าทั่วไป
-    lang_hint: Optional[str] = None,                 # เช่น "th-TH", "en-US"
+    lang_hint: Optional[str] = None,                 # เช่น "th-TH", "en-US", "km-KH"
     enable_punctuation: bool = True,
     max_alternatives: int = 1,
     # ตัวเลือกเสริม
@@ -193,13 +224,12 @@ async def stt_transcribe_bytes(
     # ⛔ sync เหมาะกับไฟล์ไม่เกิน ~9MB (base64 แล้วจะพองอีก)
     if len(audio_bytes or b"") > 9_000_000:
         if bucket:
-            # ส่งต่อไป long-running
             mime = _guess_mime_by_ext(filename, content_type)
             ext = _guess_ext(filename, mime)
             language_code = _norm_lang(lang_hint) or "th-TH"
-            # เติม en-US ให้อัตโนมัติกรณีไทยปนอังกฤษ
-            alt_codes = alternative_language_codes
-            if language_code.startswith("th") and (not alt_codes or "en-US" not in alt_codes):
+            alt_codes = _norm_alt_codes(alternative_language_codes)
+            # เติม en-US ให้อัตโนมัติกับภาษาในภูมิภาคที่ปนอังกฤษบ่อย (ไทย/เขมร/พม่า)
+            if language_code.split("-")[0] in {"th", "km", "my"} and (not alt_codes or "en-US" not in [a for a in alt_codes]):
                 alt_codes = ["en-US"] + (alt_codes or [])
             text, raw = await _stt_longrun(
                 audio_bytes,
@@ -221,12 +251,12 @@ async def stt_transcribe_bytes(
 
     # ภาษา: ถ้า caller ไม่ส่งมา ให้ default เป็นไทย และ normalize ให้ Google ชอบ
     language_code = _norm_lang(lang_hint) or "th-TH"
+    alt_codes = _norm_alt_codes(alternative_language_codes)
 
     # ⭐ บังคับไป long-running เลยถ้าไฟล์บีบอัดและน่าจะยาวเกิน 1 นาที
     if bucket and _should_force_longrun(encoding, len(audio_bytes or b"")):
         ext = _guess_ext(filename, mime)
-        alt_codes = alternative_language_codes
-        if language_code.startswith("th") and (not alt_codes or "en-US" not in alt_codes):
+        if language_code.split("-")[0] in {"th", "km", "my"} and (not alt_codes or "en-US" not in [a for a in alt_codes]):
             alt_codes = ["en-US"] + (alt_codes or [])
         text, raw = await _stt_longrun(
             audio_bytes,
@@ -252,7 +282,7 @@ async def stt_transcribe_bytes(
         model=model,
         use_enhanced=use_enhanced,
         encoding=encoding,
-        alternative_language_codes=alternative_language_codes,
+        alternative_language_codes=alt_codes,
         sample_rate_hz=sample_rate_hz,
     )
 
@@ -268,8 +298,7 @@ async def stt_transcribe_bytes(
             body = resp.text or ""
             if bucket and resp.status_code == 400 and "Sync input too long" in body:
                 ext = _guess_ext(filename, mime)
-                alt_codes = alternative_language_codes
-                if language_code.startswith("th") and (not alt_codes or "en-US" not in alt_codes):
+                if language_code.split("-")[0] in {"th", "km", "my"} and (not alt_codes or "en-US" not in [a for a in alt_codes]):
                     alt_codes = ["en-US"] + (alt_codes or [])
                 text, raw = await _stt_longrun(
                     audio_bytes,
