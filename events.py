@@ -393,7 +393,7 @@ def register_message_handlers(bot):
                     source_message=message,
                     on_choose_lang=_run_stt_with_lang,
                     flags=FLAGS,
-                    major_langs=["th", "en", "ja", "km", "my", "zh"],
+                    major_langs=["th", "en", "ja"],
                     major_primary="th",
                 )
                 await panel.attach(message.channel)
