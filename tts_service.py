@@ -14,10 +14,13 @@ from tts_lang_resolver import (
     sanitize_requested_lang, normalize_parts_shape, strip_emojis_for_tts,
 )
 
+import logging
+logger = logging.getLogger(__name__)
+
 # =========================
 # Engine selection (extensible)
 # =========================
-user_tts_engine = defaultdict(lambda: "gtts")   # "gtts" | "edge" (reserved for future)
+user_tts_engine = defaultdict(lambda: "gtts")
 server_tts_engine = defaultdict(lambda: "gtts")
 
 def get_tts_engine(user_id: int, guild_id: int) -> str:
@@ -32,15 +35,12 @@ tts_queues = defaultdict(asyncio.Queue)
 playback_generation = defaultdict(int)
 
 # =========================
-# Internal helpers
+# Helpers
 # =========================
 def _tmp_mp3() -> str:
     return f"tts_{uuid4().hex}.mp3"
 
 def _chunk_text_for_gtts(text: str, max_len: int = 200) -> List[str]:
-    """
-    gTTS บางครั้งจะล่มกับข้อความยาวมาก → ตัดเป็นชิ้นสั้น ๆ ตามช่องว่าง
-    """
     t = (text or "").strip()
     if not t:
         return []
@@ -83,9 +83,6 @@ async def _safe_voice_disconnect(vc: Optional[discord.VoiceClient]) -> None:
         pass
 
 async def safe_voice_connect(guild_id: int, voice_channel: discord.VoiceChannel) -> Optional[discord.VoiceClient]:
-    """
-    เชื่อมต่อ voice โดยกัน race กับกิลด์เดียวกัน และพยายาม reconnect แบบนุ่มนวล
-    """
     max_retries = 2
     async with voice_locks[guild_id]:
         for _ in range(max_retries):
@@ -115,9 +112,6 @@ async def safe_voice_connect(guild_id: int, voice_channel: discord.VoiceChannel)
     return None
 
 async def _play_mp3(vc: discord.VoiceClient, path: str, rate: float = 1.0, timeout: float = 60.0) -> None:
-    """
-    เล่นไฟล์ mp3 ด้วย FFmpeg; รองรับ atempo สำหรับปรับความเร็ว 0.5–2.0
-    """
     if not os.path.exists(path) or os.path.getsize(path) < 1000:
         return
 
@@ -140,26 +134,15 @@ async def _play_mp3(vc: discord.VoiceClient, path: str, rate: float = 1.0, timeo
         pass
 
 def _normalize_engine_lang(code: str) -> Tuple[str, str]:
-    """
-    รวมการ normalize โค้ดภาษาให้เข้ากับ gTTS/เอ็นจิน
-    - แก้ alias เช่น fil→tl, km-KH→km, zh→zh-CN (ถ้าจำเป็น)
-    """
     req = sanitize_requested_lang(code or "auto")
     if req == "auto":
         return "en", "en"
     gtts_key, display = normalize_gtts_lang(req)
-
-    # gTTS ไม่รู้จัก 'zh' เปล่า ๆ → บังคับ zh-CN
     if gtts_key == "zh":
         gtts_key, display = "zh-CN", "zh-CN"
     return gtts_key, display
 
 def _supported_by_gtts(lang: str) -> bool:
-    """
-    ตรวจแบบเร็ว ๆ ว่า gTTS น่าจะรองรับโค้ดนี้หรือไม่
-    (gTTS มีรายการภาษาคงที่; เราเช็คแบบอนุมาน)
-    """
-    # รายการนี้ไม่ครบทุกตัวของ gTTS แต่ครอบคลุมที่โปรเจ็กต์ใช้
     likely = {
         "en","th","ja","zh-CN","zh-TW","ko","ru","de","fr","es","pt","it","tl","fil","vi","id",
         "hi","ar","km","my","pl","uk"
@@ -167,19 +150,11 @@ def _supported_by_gtts(lang: str) -> bool:
     return lang in likely
 
 def _pick_engine_for_lang(lang: str) -> str:
-    """
-    ปัจจุบันมีเฉพาะ gTTS; ถ้าภาษานั้นไม่น่ารองรับ ควร fallback อังกฤษ (กันพัง)
-    อนาคตถ้าเพิ่ม Edge/Azure/Google TTS ให้ตัดสินใจที่นี่
-    """
     if _supported_by_gtts(lang):
         return "gtts"
-    return "gtts"  # ยังไงก็ gTTS แต่จะ fallback ภาษาภายใน
+    return "gtts"
 
 def _synthesize_gtts(text: str, lang: str) -> Optional[str]:
-    """
-    สังเคราะห์เสียงด้วย gTTS; คืน path ไฟล์ mp3 หรือ None ถ้าล้มเหลว
-    - รองรับการ chunk ข้อความยาว: จะรวมหลายชิ้นเล่นต่อ ๆ กันด้านบนแทน (เราคืนทีละไฟล์)
-    """
     try:
         filename = _tmp_mp3()
         gTTS(text=text, lang=lang).save(filename)
@@ -190,20 +165,12 @@ def _synthesize_gtts(text: str, lang: str) -> Optional[str]:
     return None
 
 async def _speak_text_with_lang(vc: discord.VoiceClient, text: str, lang_code: str, rate: float = 1.0) -> None:
-    """
-    อ่านออกเสียง 1 ท่อน ด้วยภาษา lang_code
-    - Normalize โค้ดภาษา
-    - ตัดเป็นชิ้นย่อยถ้าจำเป็น แล้วเล่นต่อเนื่อง
-    - มี fallback เป็น en กันพัง
-    """
     t = strip_emojis_for_tts(text or "").strip()
     if not t:
         return
 
     eng_key, eng_disp = _normalize_engine_lang(lang_code)
     engine = _pick_engine_for_lang(eng_key)
-
-    # ตัดชิ้น
     segments = _chunk_text_for_gtts(t, max_len=200)
 
     if engine == "gtts":
@@ -211,7 +178,6 @@ async def _speak_text_with_lang(vc: discord.VoiceClient, text: str, lang_code: s
             lang_try = eng_key
             path = _synthesize_gtts(seg, lang_try)
             if path is None and lang_try not in ("en",):
-                # ลอง fallback zh→zh-CN, fil→tl ทำไปแล้วใน normalize; ขั้นนี้ลอง en กันพัง
                 path = _synthesize_gtts(seg, "en")
             if path:
                 try:
@@ -219,7 +185,6 @@ async def _speak_text_with_lang(vc: discord.VoiceClient, text: str, lang_code: s
                 finally:
                     await _safe_remove(path)
     else:
-        # เผื่ออนาคตต่อ engine อื่น
         for seg in segments:
             path = _synthesize_gtts(seg, "en")
             if path:
@@ -232,9 +197,6 @@ async def _speak_text_with_lang(vc: discord.VoiceClient, text: str, lang_code: s
 # Public APIs
 # =========================
 async def speak_text(message: discord.Message, text: str, lang: str = "auto") -> None:
-    """
-    อ่านข้อความเดี่ยวด้วยภาษาเดียว (auto-detect ถ้า lang='auto')
-    """
     if not getattr(message.author, "voice", None):
         return
 
@@ -262,8 +224,6 @@ async def speak_text(message: discord.Message, text: str, lang: str = "auto") ->
                     requested = resolve_tts_code(speak_text_value, "auto")
 
                 gtts_key, display_code = _normalize_engine_lang(requested)
-
-                # ใช้ _speak_text_with_lang เพื่อรองรับ chunk และ fallback
                 await _speak_text_with_lang(vc, speak_text_value, gtts_key, rate=1.0)
 
             except Exception:
@@ -272,22 +232,11 @@ async def speak_text(message: discord.Message, text: str, lang: str = "auto") ->
                 if filename:
                     await _safe_remove(filename)
 
-async def speak_text_multi(
-    message: discord.Message,
-    parts: List[Tuple[str, str]],
-    playback_rate: float = 1.0,
-    preferred_lang: Optional[str] = None,
-) -> None:
-    """
-    อ่านหลายท่อน (แต่ละท่อนอาจเป็นคนละภาษา)
-    - ใช้ resolve_parts_for_tts() → ได้ [(text, lang_code), ...] ที่ normalize แล้ว
-    - เล่นท่อนละไฟล์ต่อเนื่องตามลำดับ
-    """
+async def speak_text_multi(message: discord.Message, parts: List[Tuple[str, str]], playback_rate: float = 1.0, preferred_lang: Optional[str] = None) -> None:
     if not getattr(message.author, "voice", None):
         return
 
     guild_id = message.guild.id
-    # ปรับรูปทรง parts ก่อน
     shaped = normalize_parts_shape(parts)
     if not shaped:
         return
@@ -308,16 +257,13 @@ async def speak_text_multi(
                 if not vc:
                     continue
 
-                # ให้ resolver คืน [(text, lang)] ที่จัดภาษาต่อท่อนได้แล้ว
                 resolved_parts = resolve_parts_for_tts(input_parts, preferred_lang=pref)
 
-                # เล่นทีละท่อนตามภาษา (ไม่ merge เป็นภาษาเดียว)
                 for seg_text, seg_lang in resolved_parts:
                     seg_text = strip_emojis_for_tts(seg_text or "").strip()
                     if not seg_text:
                         continue
 
-                    # ถ้า user บังคับ preferred_lang (ไม่ใช่ auto) → ใช้ตามนั้น
                     if pref:
                         pref_sanitized = sanitize_requested_lang(pref)
                         if pref_sanitized and pref_sanitized.lower() != "auto":
@@ -332,21 +278,54 @@ async def speak_text_multi(
 async def interrupt_tts(guild_id: int) -> None:
     try:
         playback_generation[guild_id] += 1
-        # ที่เหลือยังไม่ใช้ใน flow ปัจจุบัน
     except Exception:
         pass
 
+# =========================
+# NEW — Empty VC Watcher (แก้ใหม่)
+# =========================
+_empty_vc_task = None
+
 def start_empty_vc_watcher(bot: commands.Bot):
+    """
+    Watcher ออกจากห้องอัตโนมัติเมื่อไม่มี human เหลือ
+    """
+
+    global _empty_vc_task
+
+    # กัน start ซ้ำ
+    if _empty_vc_task is not None and not _empty_vc_task.done():
+        logger.info("[empty_vc] watcher already running, skip start()")
+        return
+
     async def _watcher():
+        logger.info("[empty_vc] watcher started")
         while True:
             try:
                 for guild in bot.guilds:
                     vc = guild.voice_client
-                    if vc and vc.is_connected():
-                        members = [m for m in vc.channel.members if not m.bot]
-                        if not members:
-                            await vc.disconnect()
-            except Exception:
-                pass
+                    if not vc or not vc.is_connected():
+                        continue
+
+                    all_members = list(vc.channel.members)
+                    humans = [m for m in all_members if not m.bot]
+
+                    logger.debug(
+                        f"[empty_vc] guild={guild.id} "
+                        f"channel={vc.channel.name} "
+                        f"members={[f'{m} (bot={m.bot})' for m in all_members]}"
+                    )
+
+                    if not humans:
+                        await vc.disconnect()
+                        logger.info(
+                            f"👋 Left empty voice channel '{vc.channel.name}' "
+                            f"in guild '{guild.name}' (no humans left)"
+                        )
+
+            except Exception as e:
+                logger.exception(f"[empty_vc] loop crashed: {e}")
+
             await asyncio.sleep(10)
-    bot.loop.create_task(_watcher())
+
+    _empty_vc_task = bot.loop.create_task(_watcher())
